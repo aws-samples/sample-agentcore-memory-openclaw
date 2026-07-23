@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#
+# .githooks/pre-push — Auto-push the public ECR image when agent-container/ changes.
+#
+# Activate this hook by running (once per clone):
+#   git config core.hooksPath .githooks
+#
+# When commits being pushed include changes under agent-container/ or the
+# Dockerfile, this hook builds and pushes the public image so the one-click
+# Launch Stack button always pulls the latest container. If the push fails
+# (e.g. Docker not running, no AWS auth), the git push continues with a warning
+# rather than blocking your workflow.
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Read the local and remote refs from stdin (git pre-push protocol).
+while read -r local_ref local_sha remote_ref remote_sha; do
+  # Only check pushes to main.
+  if [[ "$remote_ref" != "refs/heads/main" ]]; then
+    continue
+  fi
+
+  # Detect if any agent-container/ files changed between what's already on the
+  # remote and what we're pushing. For a new branch (remote_sha all zeros),
+  # compare against HEAD~20 as a reasonable window.
+  if [[ "$remote_sha" == "0000000000000000000000000000000000000000" ]]; then
+    base="HEAD~20"
+  else
+    base="$remote_sha"
+  fi
+
+  changed_files=$(git diff --name-only "$base" "$local_sha" 2>/dev/null || echo "")
+
+  if echo "$changed_files" | grep -qE "^agent-container/"; then
+    echo "pre-push: agent-container/ changed — rebuilding public ECR image..."
+    if bash "${SCRIPT_DIR}/scripts/push-public-image.sh"; then
+      echo "pre-push: public image updated ✓"
+    else
+      echo "pre-push: WARNING — public image push failed (continuing git push anyway)"
+    fi
+    break
+  fi
+done
+
+exit 0

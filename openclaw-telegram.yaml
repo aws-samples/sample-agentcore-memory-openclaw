@@ -1,0 +1,1026 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OpenClaw Telegram AgentCore - Serverless gardening assistant (Sprout) deployed
+  with Amazon Bedrock AgentCore Runtime, AgentCore Memory, and Telegram webhook integration.
+
+# ==============================================================================
+# Parameters
+# ==============================================================================
+Parameters:
+  TelegramBotToken:
+    Type: String
+    NoEcho: true
+    Description: Telegram Bot API token from BotFather
+    MinLength: 1
+    ConstraintDescription: Telegram bot token must not be empty
+
+  ModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: >
+      Bedrock model ID or cross-region inference profile.
+      Defaults to Claude Haiku 4.5 cross-region inference profile.
+
+  VisionModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+    Description: >
+      Bedrock model ID or cross-region inference profile used for plant image
+      identification (vision). Sonnet is more accurate for visual tasks; the
+      text ModelId stays on the faster/cheaper model to control cost.
+
+  MonthlyBudgetLimit:
+    Type: Number
+    Default: 25
+    MinValue: 1
+    MaxValue: 10000
+    Description: Monthly budget limit in USD (1 to 10000)
+    ConstraintDescription: Must be a number between 1 and 10000
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: >
+      Email address for budget and operational alerts.
+      Leave empty to skip email subscription.
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address or empty
+
+  DeploymentVersion:
+    Type: String
+    Default: '1'
+    Description: >
+      Opaque deployment version bumped on each deploy (e.g. a timestamp). It is
+      injected into the AgentCore Runtime environment so a container-only change
+      (same :latest image URI) still forces the runtime to update and re-pull
+      the freshly pushed image.
+
+  ContainerImageUri:
+    Type: String
+    # Replace <ECR_PUBLIC_ALIAS> with the published AWS-owned ECR Public alias
+    # once the image is mirrored there for the one-click deploy. Until then,
+    # build and push your own image with scripts/deploy.sh, which overrides this
+    # parameter with your private ECR URI.
+    Default: 'public.ecr.aws/<ECR_PUBLIC_ALIAS>/sprout-agent:latest'
+    Description: >
+      Container image URI for the AgentCore Runtime. Defaults to the publicly
+      hosted Sprout image (one-click deploy). Override with a private ECR URI
+      when using a custom build via deploy.sh.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues:
+      - 1
+      - 3
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+      - 400
+    Description: Number of days to retain CloudWatch logs
+
+# ==============================================================================
+# Conditions
+# ==============================================================================
+Conditions:
+  HasAlertEmail: !Not
+    - !Equals
+      - !Ref AlertEmail
+      - ''
+
+# ==============================================================================
+# Resources
+# ==============================================================================
+Resources:
+
+  # ----------------------------------------------------------------------------
+  # IAM Roles
+  # ----------------------------------------------------------------------------
+  RuntimeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-runtime-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockInvokeModel
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+        - PolicyName: AgentCoreMemoryDataPlane
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:CreateEvent
+                  - bedrock-agentcore:RetrieveMemoryRecords
+                  - bedrock-agentcore:ListMemoryRecords
+                  - bedrock-agentcore:BatchUpdateMemoryRecords
+                  - bedrock-agentcore:DeleteMemoryRecord
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:memory/*'
+        - PolicyName: ECRPull
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchCheckLayerAvailability
+                Resource:
+                  - !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${AWS::StackName}-agent'
+                  - 'arn:aws:ecr-public::*:repository/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/*'
+        - PolicyName: S3WorkspaceAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${AWS::StackName}-workspace-${AWS::AccountId}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${AWS::StackName}-workspace-${AWS::AccountId}'
+        - PolicyName: KMSDecrypt
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+        # The agent self-schedules memory-driven reminders by calling the
+        # EventBridge Scheduler control plane directly. Scope the schedule
+        # management to the dedicated reminder group only, and allow PassRole
+        # exclusively for the CronSchedulerRole and only when passed to the
+        # scheduler service (least privilege for an LLM-driven container).
+        - PolicyName: EventBridgeSchedulerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ManageReminderSchedules
+                Effect: Allow
+                Action:
+                  - scheduler:CreateSchedule
+                  - scheduler:UpdateSchedule
+                  - scheduler:DeleteSchedule
+                  - scheduler:GetSchedule
+                  - scheduler:ListSchedules
+                Resource:
+                  - !Sub 'arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${AWS::StackName}-cron/*'
+              - Sid: PassCronSchedulerRole
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                # Constructed from the role's fixed RoleName rather than
+                # !GetAtt to avoid a CloudFormation circular dependency
+                # (RuntimeExecutionRole -> CronSchedulerRole -> CronLambda ->
+                # AgentCoreRuntime -> RuntimeExecutionRole).
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-cron-scheduler-role'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: scheduler.amazonaws.com
+
+  MemoryExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-memory-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockInvokeModel
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+
+  WebhookLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-webhook-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeAgentRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*'
+        - PolicyName: GetSecretValue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AWS::StackName}/telegram-bot-token*'
+        - PolicyName: KMSDecrypt
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-webhook*'
+
+  CronLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-cron-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeAgentRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*'
+        - PolicyName: GetSecretValue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AWS::StackName}/telegram-bot-token*'
+        - PolicyName: KMSDecrypt
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-cron*'
+
+  # ----------------------------------------------------------------------------
+  # KMS Customer Managed Key
+  # ----------------------------------------------------------------------------
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK for encrypting Sprout bot token secret and S3 workspace objects
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: sprout-encryption-key-policy
+        Statement:
+          - Sid: AllowRootAccountFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+          - Sid: AllowRuntimeRoleUsage
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt RuntimeExecutionRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+
+          - Sid: AllowMemoryRoleUsage
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt MemoryExecutionRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+
+          - Sid: AllowWebhookLambdaRoleUsage
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt WebhookLambdaRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: '*'
+
+          - Sid: AllowCronLambdaRoleUsage
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt CronLambdaRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: '*'
+
+          - Sid: AllowSecretsManagerUsage
+            Effect: Allow
+            Principal:
+              Service: secretsmanager.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+
+          - Sid: AllowS3ServerAccessLogEncryption
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-encryption-key'
+      TargetKeyId: !Ref EncryptionKey
+
+  # ----------------------------------------------------------------------------
+  # Secrets Manager - Telegram Bot Token
+  # ----------------------------------------------------------------------------
+  BotTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/telegram-bot-token'
+      Description: Telegram Bot API token for Sprout
+      KmsKeyId: !Ref EncryptionKey
+      SecretString: !Ref TelegramBotToken
+
+  # Bearer token securing the OpenClaw gateway's loopback /v1/chat/completions
+  # and /health endpoints. Auto-generated (never supplied by a human) and
+  # KMS-encrypted with the same CMK as the bot token. Its value is injected into
+  # the AgentCore Runtime container environment as OPENCLAW_AUTH_TOKEN via a
+  # CloudFormation dynamic reference, and openclaw.json substitutes it at
+  # gateway startup.
+  OpenClawAuthTokenSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/openclaw-auth-token'
+      Description: Bearer token for the OpenClaw gateway loopback endpoint
+      KmsKeyId: !Ref EncryptionKey
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  # Dedicated secret Telegram echoes in the X-Telegram-Bot-Api-Secret-Token
+  # header on every webhook delivery. It is separate from the bot token because
+  # Telegram restricts secret_token to [A-Za-z0-9_-]; ExcludePunctuation yields
+  # an alphanumeric value in that allowed set. The deploy script reads this value
+  # and passes it as setWebhook's secret_token; the webhook Lambda compares the
+  # inbound header against it (WEBHOOK_SECRET_TOKEN).
+  WebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/webhook-secret'
+      Description: Telegram webhook secret-token for request authentication
+      KmsKeyId: !Ref EncryptionKey
+      GenerateSecretString:
+        PasswordLength: 48
+        ExcludePunctuation: true
+
+  # ----------------------------------------------------------------------------
+  # S3 Server Access Logs Bucket
+  # ----------------------------------------------------------------------------
+  # Destination for the WorkspaceBucket's S3 server access logs (CKV_AWS_18).
+  # It uses the modern S3 log-delivery model: logs are written by the
+  # `logging.s3.amazonaws.com` service principal (granted by AccessLogsBucketPolicy
+  # and the KMS key policy), so ACLs stay disabled (BucketOwnerEnforced).
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18:This IS the access-log destination bucket; enabling
+    # server access logging on it would create a self-referential logging loop.
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-access-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt EncryptionKey.Arn
+            BucketKeyEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ServerAccessLogsDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt WorkspaceBucket.Arn
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+          - Sid: DenyNonSecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ----------------------------------------------------------------------------
+  # S3 Workspace Bucket
+  # ----------------------------------------------------------------------------
+  WorkspaceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-workspace-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt EncryptionKey.Arn
+            BucketKeyEnabled: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: workspace-access-logs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  WorkspaceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WorkspaceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRuntimeRoleAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt RuntimeExecutionRole.Arn
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt WorkspaceBucket.Arn
+              - !Sub '${WorkspaceBucket.Arn}/*'
+
+          - Sid: DenyNonSecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt WorkspaceBucket.Arn
+              - !Sub '${WorkspaceBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ----------------------------------------------------------------------------
+  # AgentCore Memory
+  # ----------------------------------------------------------------------------
+  # AgentCore Memory provides cross-session recall. The managed extraction
+  # strategies asynchronously derive long-term records from session events.
+  #   - USER_PREFERENCE  -> explicit user preferences  -> sprout/{actorId}/long_term
+  #   - SEMANTIC         -> inferred factual knowledge  -> sprout/{actorId}/long_term
+  #   - SUMMARIZATION    -> episodic session summaries  -> sprout/{actorId}/episodic/{sessionId}
+  # Memory resource names must match [a-zA-Z][a-zA-Z0-9_]{0,47} (no hyphens),
+  # so a static underscore-free name is used rather than the stack name.
+  AgentCoreMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    Properties:
+      Name: SproutMemory
+      Description: Cross-session memory for the Sprout gardening assistant
+      EventExpiryDuration: 30
+      MemoryExecutionRoleArn: !GetAtt MemoryExecutionRole.Arn
+      MemoryStrategies:
+        - UserPreferenceMemoryStrategy:
+            Name: SproutUserPreference
+            Description: Extracts explicit user gardening preferences
+            Namespaces:
+              - "sprout/{actorId}/long_term"
+        - SemanticMemoryStrategy:
+            Name: SproutSemantic
+            Description: Extracts inferred factual knowledge about the user's garden
+            Namespaces:
+              - "sprout/{actorId}/long_term"
+        - SummaryMemoryStrategy:
+            Name: SproutSummarization
+            Description: Condenses session transcripts into episodic summaries
+            Namespaces:
+              - "sprout/{actorId}/episodic/{sessionId}"
+
+  # ----------------------------------------------------------------------------
+  # AgentCore Runtime
+  # ----------------------------------------------------------------------------
+  # Hosts the OpenClaw container (linux/arm64). The container image is built and
+  # pushed to ECR by the deploy script before the stack is created/updated.
+  # AgentRuntimeName must match [a-zA-Z][a-zA-Z0-9_]{0,47} (no hyphens).
+  AgentCoreRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    Properties:
+      AgentRuntimeName: SproutRuntime
+      Description: OpenClaw gardening assistant runtime
+      RoleArn: !GetAtt RuntimeExecutionRole.Arn
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Ref ContainerImageUri
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      # server.py reads MODEL_ID/MEMORY_ID/WORKSPACE_BUCKET; the OpenClaw gateway
+      # config (openclaw.json) reads BEDROCK_MODEL_ID/AWS_REGION/OPENCLAW_AUTH_TOKEN.
+      # BEDROCK_MODEL_ID mirrors MODEL_ID so a single ModelId parameter drives both.
+      EnvironmentVariables:
+        MODEL_ID: !Ref ModelId
+        BEDROCK_MODEL_ID: !Ref ModelId
+        MEMORY_ID: !GetAtt AgentCoreMemory.MemoryId
+        WORKSPACE_BUCKET: !Ref WorkspaceBucket
+        AWS_REGION: !Ref AWS::Region
+        OPENCLAW_AUTH_TOKEN: !Sub '{{resolve:secretsmanager:${OpenClawAuthTokenSecret}:SecretString}}'
+        DEPLOYMENT_VERSION: !Ref DeploymentVersion
+        VISION_MODEL_ID: !Ref VisionModelId
+        # Memory-driven proactive scheduling: the agent creates EventBridge
+        # Scheduler reminders in a dedicated group, targeting the Cron (invoker)
+        # Lambda and passing the CronSchedulerRole so Scheduler can invoke it.
+        # These ARNs are built from the target resources' fixed names (RoleName
+        # / FunctionName) instead of !GetAtt: CronLambda depends on this
+        # runtime's ARN, so a !GetAtt back to CronLambda/CronSchedulerRole would
+        # form a circular dependency. The names are deterministic, so the
+        # constructed ARNs are exact.
+        CRON_SCHEDULER_ROLE_ARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${AWS::StackName}-cron-scheduler-role'
+        CRON_INVOKER_FUNCTION_ARN: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-cron'
+        CRON_SCHEDULER_GROUP: !Sub '${AWS::StackName}-cron'
+
+  # ----------------------------------------------------------------------------
+  # Lambda Functions
+  # ----------------------------------------------------------------------------
+  # The inline ZipFile code below is a placeholder. The deploy script packages
+  # and uploads the real handler code (telegram-webhook/) during deployment.
+  WebhookLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-webhook'
+      Runtime: python3.11
+      Handler: handler.lambda_handler
+      Role: !GetAtt WebhookLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200}
+      Environment:
+        Variables:
+          AGENTCORE_RUNTIME_ARN: !GetAtt AgentCoreRuntime.AgentRuntimeArn
+          BOT_TOKEN_SECRET_ARN: !Ref BotTokenSecret
+          TELEGRAM_API_BASE: 'https://api.telegram.org'
+          WEBHOOK_SECRET_TOKEN: !Sub '{{resolve:secretsmanager:${WebhookSecret}:SecretString}}'
+          # Salts the per-chat runtimeSessionId with the deploy version. AgentCore
+          # pins a session to the runtime version it was created on, so a stable
+          # session would stick to an old version forever. Rotating the salt each
+          # deploy makes sessions migrate to the newest runtime version while
+          # staying stable (conversational continuity) between deploys.
+          RUNTIME_SESSION_SALT: !Ref DeploymentVersion
+
+  # CronLambda is the bridge/invoker for proactive scheduling: EventBridge
+  # Scheduler (assuming CronSchedulerRole) invokes it with an Input payload
+  # {"chat_ids": [...], "task_type": "..."}, and it in turn invokes the
+  # AgentCore Runtime (invocation_type="cron") and delivers the reply to
+  # Telegram. The agent creates those schedules dynamically in CronSchedulerGroup.
+  CronLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-cron'
+      Runtime: python3.11
+      Handler: cron_handler.lambda_handler
+      Role: !GetAtt CronLambdaRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {'statusCode': 200}
+      Environment:
+        Variables:
+          AGENTCORE_RUNTIME_ARN: !GetAtt AgentCoreRuntime.AgentRuntimeArn
+          BOT_TOKEN_SECRET_ARN: !Ref BotTokenSecret
+          TELEGRAM_API_BASE: 'https://api.telegram.org'
+
+  # ----------------------------------------------------------------------------
+  # API Gateway (HTTP API) - Telegram Webhook
+  # ----------------------------------------------------------------------------
+  # HTTP APIs are HTTPS-only by default; no plaintext HTTP listener is exposed.
+  WebhookApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-webhook-api'
+      Description: HTTPS endpoint receiving Telegram webhook updates
+      ProtocolType: HTTP
+
+  WebhookIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebhookApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt WebhookLambda.Arn
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
+
+  WebhookRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebhookApi
+      RouteKey: 'POST /webhook'
+      Target: !Sub 'integrations/${WebhookIntegration}'
+
+  WebhookStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebhookApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  # ----------------------------------------------------------------------------
+  # Lambda Permissions
+  # ----------------------------------------------------------------------------
+  WebhookLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WebhookLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebhookApi}/*/*/webhook'
+
+  # Allow EventBridge Scheduler to invoke the Cron (invoker) Lambda. The
+  # SourceArn is scoped to every schedule inside the dedicated reminder group,
+  # so it covers both the optional fixed-rate sweep and the schedules the agent
+  # creates dynamically at runtime.
+  CronLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CronLambda
+      Principal: scheduler.amazonaws.com
+      SourceArn: !Sub 'arn:aws:scheduler:${AWS::Region}:${AWS::AccountId}:schedule/${AWS::StackName}-cron/*'
+
+  # ----------------------------------------------------------------------------
+  # EventBridge Scheduler - reminder group + roles
+  # ----------------------------------------------------------------------------
+  # A dedicated schedule group holds every dynamically-created reminder schedule
+  # (created by the agent via scheduler:CreateSchedule) plus the optional
+  # fixed-rate sweep below. Grouping lets IAM scope both the runtime's schedule
+  # management and the Lambda invoke permission to a single ARN path.
+  CronSchedulerGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-cron'
+
+  # The single EventBridge Scheduler role. Scheduler assumes it (scoped to this
+  # account) to invoke the Cron (invoker) Lambda. It is passed by the fixed-rate
+  # sweep below and by every schedule the agent creates at runtime (the runtime
+  # role may iam:PassRole this role only to scheduler.amazonaws.com).
+  CronSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-cron-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: InvokeCronLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt CronLambda.Arn
+
+  # NOTE: There is no fixed-rate "sweep" schedule. Reminders are created on
+  # demand by the agent (scheduler:CreateSchedule) as individual schedules
+  # inside CronSchedulerGroup, each targeting the Cron (invoker) Lambda via
+  # CronSchedulerRole. The group and role above exist so those dynamically
+  # created schedules have a home and an invoke role; CronLambdaPermission
+  # authorizes every schedule in the group to invoke the Lambda.
+
+  # ----------------------------------------------------------------------------
+  # CloudWatch Log Groups
+  # ----------------------------------------------------------------------------
+  # Explicit log groups give us control over retention (LogRetentionDays) rather
+  # than relying on the implicit, never-expiring groups Lambda/AgentCore create.
+  WebhookLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-webhook'
+      RetentionInDays: !Ref LogRetentionDays
+
+  CronLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-cron'
+      RetentionInDays: !Ref LogRetentionDays
+
+  RuntimeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/bedrock-agentcore/${AWS::StackName}-runtime'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ----------------------------------------------------------------------------
+  # SNS Alert Topic (budget + operational alarms)
+  # ----------------------------------------------------------------------------
+  BudgetAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alerts'
+      DisplayName: Sprout budget and operational alerts
+      KmsMasterKeyId: !Ref EncryptionKey
+
+  # Allow the AWS Budgets and CloudWatch service principals to publish alerts
+  # to the topic. Budgets requires an explicit topic policy to deliver
+  # notifications; CloudWatch alarm actions publish here as well.
+  BudgetAlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref BudgetAlertTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowBudgetsPublish
+            Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref BudgetAlertTopic
+          - Sid: AllowCloudWatchPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref BudgetAlertTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # Email subscription is only created when an AlertEmail was supplied.
+  BudgetAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref BudgetAlertTopic
+
+  # ----------------------------------------------------------------------------
+  # CloudWatch Alarms
+  # ----------------------------------------------------------------------------
+  # Webhook Lambda error rate > 5% over 5 minutes, 3 consecutive periods.
+  # Uses metric math: e1 = Errors / Invocations * 100.
+  ErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-webhook-error-rate'
+      AlarmDescription: Webhook Lambda error rate exceeded 5% over 5 minutes
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 5
+      EvaluationPeriods: 3
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BudgetAlertTopic
+      Metrics:
+        - Id: e1
+          Expression: '(m1 / m2) * 100'
+          Label: WebhookErrorRatePercent
+          ReturnData: true
+        - Id: m1
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref WebhookLambda
+            Period: 300
+            Stat: Sum
+        - Id: m2
+          ReturnData: false
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Invocations
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Ref WebhookLambda
+            Period: 300
+            Stat: Sum
+
+  # AgentCore Runtime p99 invocation duration > 55s over 5 minutes,
+  # 3 consecutive periods. Threshold is expressed in milliseconds (55000 ms).
+  # NOTE: The AgentCore Runtime metric namespace/name are a best-effort guess
+  # (AWS/BedrockAgentCore, Duration in ms) and may need adjustment once the
+  # service's published CloudWatch metrics are confirmed.
+  LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-runtime-p99-latency'
+      AlarmDescription: AgentCore Runtime p99 invocation duration exceeded 55 seconds
+      Namespace: AWS/BedrockAgentCore
+      MetricName: Duration
+      Dimensions:
+        # AgentRuntimeName is not a returnable attribute of the Runtime resource,
+        # so the statically-defined runtime name (see AgentCoreRuntime) is used.
+        - Name: AgentRuntimeName
+          Value: SproutRuntime
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 55000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BudgetAlertTopic
+
+  # ----------------------------------------------------------------------------
+  # AWS Budget - monthly cost tracking with 80% and 100% alerts
+  # ----------------------------------------------------------------------------
+  Budget:
+    Type: AWS::Budgets::Budget
+    DependsOn: BudgetAlertTopicPolicy
+    Properties:
+      Budget:
+        BudgetName: !Sub '${AWS::StackName}-monthly-budget'
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetLimit
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref BudgetAlertTopic
+
+# ==============================================================================
+# Outputs
+# ==============================================================================
+Outputs:
+  WebhookUrl:
+    Description: API Gateway HTTPS endpoint to register as the Telegram webhook URL
+    Value: !Sub 'https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/webhook'
+
+  RuntimeArn:
+    Description: AgentCore Runtime ARN
+    Value: !GetAtt AgentCoreRuntime.AgentRuntimeArn
+
+  MemoryId:
+    Description: AgentCore Memory resource ID
+    Value: !GetAtt AgentCoreMemory.MemoryId
+
+  WorkspaceBucketName:
+    Description: S3 workspace store bucket name
+    Value: !Ref WorkspaceBucket
+
+  WebhookSecretArn:
+    Description: ARN of the Telegram webhook secret-token secret
+    Value: !Ref WebhookSecret

@@ -1,0 +1,10 @@
+# Dependencies for the Sprout Telegram Webhook and Cron Lambda functions.
+#
+# boto3 is bumped to 1.40.0+: the handlers invoke the AgentCore Runtime
+# data plane (`boto3.client("bedrock-agentcore").invoke_agent_runtime`) and
+# read the bot token from Secrets Manager. The bedrock-agentcore data-plane
+# service model only exists in newer botocore releases (1.35.x raises
+# UnknownServiceError), so the Lambda needs a current boto3.
+boto3>=1.40.0
+# requests powers the Telegram Bot API client in telegram_api.py.
+requests>=2.32.0

@@ -1,0 +1,82 @@
+THIRD-PARTY LICENSES
+
+This file lists third-party software included in, or depended upon by, this
+sample. This project's own code is licensed under MIT-0 (see LICENSE). Each
+third-party component below remains under its own license, held by its
+respective owners.
+
+IMPORTANT (pre-publication): Before the repository is made public, confirm the
+exact license and version of each component and paste the full upstream license
+text where indicated. Items marked [VERIFY] must be checked against the upstream
+source, because their license can change between releases.
+
+================================================================================
+Container base images
+================================================================================
+
+1) OpenClaw  [VERIFY]
+   Role: agent runtime, pulled as a container image and run as a gateway
+         subprocess.
+   Source: https://github.com/openclaw/openclaw
+   Image:  ghcr.io/openclaw/openclaw
+   License: See the LICENSE in the upstream repository. Confirm the license and
+            pin a specific image digest (do not ship ':latest') before release.
+            If the upstream license is not MIT/Apache-2.0/BSD-style, a policy
+            exception may be required for MIT-0 sample publication.
+
+2) python:3.12-slim  (Docker Official Image)
+   Role: base runtime image.
+   Source: https://hub.docker.com/_/python
+   License: The Python interpreter is under the PSF License Agreement; the
+            Debian-derived base layers include packages under their respective
+            licenses (see below).
+
+3) Node.js 22.x
+   Role: JavaScript runtime for the OpenClaw gateway.
+   Source: https://github.com/nodejs/node  (installed from https://deb.nodesource.com)
+   License: Node.js license (MIT-style) plus bundled components (V8, etc.);
+            see https://github.com/nodejs/node/blob/main/LICENSE
+
+================================================================================
+Operating-system packages (installed via apt in the container)
+================================================================================
+
+4) curl               — curl license (MIT/X-style) — https://curl.se/docs/copyright.html
+5) ca-certificates    — Mozilla CA bundle (MPL-2.0) — https://salsa.debian.org/debian/ca-certificates
+6) gnupg              — GPLv3 — https://gnupg.org/  [VERIFY: GPLv3 is a runtime
+   tool used only during image build to add the NodeSource key; it is not linked
+   into or distributed with the sample's own code. Confirm this build-only usage
+   is acceptable, or remove it if not needed at runtime.]
+
+================================================================================
+Python dependencies
+================================================================================
+
+7) boto3 / botocore   — Apache License 2.0 — https://github.com/boto/boto3
+8) requests           — Apache License 2.0 — https://github.com/psf/requests
+
+================================================================================
+Community skills (installed at deploy time into agent-container/skills/)
+================================================================================
+
+The following OpenClaw community skills are referenced by
+agent-container/community-skills.json and installed at deploy time:
+
+9)  weather        [VERIFY license + source]
+10) scheduler      [VERIFY license + source]
+11) plant-notes    [VERIFY license + source]
+
+   These are third-party assets. Confirm each skill's license and origin before
+   release. If any skill is not created by you and lacks a compatible license,
+   either obtain the license, replace it, or exclude it from the published
+   sample.
+
+================================================================================
+Foundation models (invoked at runtime via Amazon Bedrock)
+================================================================================
+
+This sample invokes Anthropic Claude models through Amazon Bedrock
+(e.g. Claude Haiku 4.5 for text, Claude Sonnet 4.5 for vision). Models are not
+redistributed by this repository; they are accessed as a managed service and
+are subject to the model provider's terms and the Amazon Bedrock service terms.
+See the "Datasets & Models" note in the README / review checklist.

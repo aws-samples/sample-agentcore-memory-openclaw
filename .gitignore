@@ -1,0 +1,49 @@
+# Local deployment configuration (contains the Telegram bot token secret).
+# Only .env.example (with placeholder values) should be committed.
+.env
+.env.*
+!.env.example
+.kiro
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.hypothesis/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python build / test / type-check artifacts
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Node (OpenClaw gateway / any local tooling)
+node_modules/
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# Logs and scratch
+*.log
+*.tmp
+
+# Local security-scan evidence (generated for the AppSec/OSPO review upload,
+# not part of the published sample). The curated write-ups in docs/ and the
+# root THREAT-MODEL/SECURITY files are tracked; the raw scanner dumps are not.
+security-scans/
+security-scans-bundle.zip
+*.zip

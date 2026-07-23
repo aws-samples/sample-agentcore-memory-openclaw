@@ -1,0 +1,14 @@
+Sprout — Telegram Gardening Assistant on Amazon Bedrock AgentCore
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+This product includes and/or depends on third-party software:
+
+- OpenClaw (agent runtime), distributed as a container image from
+  ghcr.io/openclaw/openclaw. See https://github.com/openclaw/openclaw for its
+  license and terms.
+- boto3 / botocore (Apache License 2.0) — https://github.com/boto/boto3
+- requests (Apache License 2.0) — https://github.com/psf/requests
+
+Each third-party component is the property of its respective owners and is
+subject to its own license. This project's own code is provided under the
+MIT-0 license; see the LICENSE file.
