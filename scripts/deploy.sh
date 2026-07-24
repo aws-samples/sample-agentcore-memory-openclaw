@@ -148,6 +148,7 @@ PYTHON_ECR_REPO="python"
 PYTHON_ECR_TAG="3.12-slim"
 
 INSTALL_SKILLS_SCRIPT="${SCRIPT_DIR}/install-skills.sh"
+MIRROR_BASE_IMAGES_SCRIPT="${SCRIPT_DIR}/mirror-base-images.sh"
 LAMBDA_SRC_DIR="${REPO_ROOT}/telegram-webhook"
 
 # Stack parameter overrides (defaults mirror openclaw-telegram.yaml).
@@ -246,52 +247,32 @@ stage_ecr_repository() {
 # Stage 4 — Mirror base images into ECR (BuilderHub internal-ECR requirement)
 # ------------------------------------------------------------------------------
 # The Dockerfile pulls its two base images (OpenClaw + python:3.12-slim) from ECR
-# via the ECR_REGISTRY build arg. Here we ensure the destination repos exist and
-# copy the upstream images into them. `docker buildx imagetools create` copies
-# the source manifest verbatim, so the OpenClaw tag+digest pin is preserved and
-# still resolves from ECR. Re-running is safe: the tag is simply re-pointed at
-# the same (content-addressed) manifest.
+# via the ECR_REGISTRY build arg. This stage delegates to the standalone
+# scripts/mirror-base-images.sh helper, which ensures the destination repos
+# exist and copies the upstream images into them with `docker buildx imagetools
+# create` (the source manifest is copied verbatim, so the OpenClaw tag+digest
+# pin is preserved and still resolves from ECR). Re-running is safe: each tag is
+# simply re-pointed at the same (content-addressed) manifest. The already
+# resolved account/region/registry and image coordinates are passed through the
+# environment so both entry points mirror identical images.
 stage_mirror_base_images() {
   log "==> [Stage 4/8] Mirroring base images into ECR"
 
-  local repo
-  for repo in "$OPENCLAW_ECR_REPO" "$PYTHON_ECR_REPO"; do
-    if aws ecr describe-repositories \
-          --repository-names "$repo" \
-          --region "$AWS_REGION" >/dev/null 2>&1; then
-      log "ECR repository '${repo}' already exists."
-    else
-      log "Creating ECR repository '${repo}'..."
-      if ! aws ecr create-repository \
-            --repository-name "$repo" \
-            --image-scanning-configuration scanOnPush=true \
-            --image-tag-mutability MUTABLE \
-            --region "$AWS_REGION" >/dev/null; then
-        fail "Mirror base images" "failed to create ECR repository '${repo}'."
-      fi
-    fi
-  done
-
-  log "Logging in to ECR registry ${REGISTRY}..."
-  if ! aws ecr get-login-password --region "$AWS_REGION" \
-        | docker login --username AWS --password-stdin "$REGISTRY" >&2; then
-    fail "Mirror base images" "ECR docker login failed."
+  if [[ ! -f "$MIRROR_BASE_IMAGES_SCRIPT" ]]; then
+    fail "Mirror base images" "mirror script not found at ${MIRROR_BASE_IMAGES_SCRIPT}."
   fi
 
-  log "Mirroring ${OPENCLAW_UPSTREAM_IMAGE}"
-  log "       -> ${REGISTRY}/${OPENCLAW_ECR_REPO}:${OPENCLAW_ECR_TAG}"
-  if ! docker buildx imagetools create \
-        --tag "${REGISTRY}/${OPENCLAW_ECR_REPO}:${OPENCLAW_ECR_TAG}" \
-        "$OPENCLAW_UPSTREAM_IMAGE" >&2; then
-    fail "Mirror base images" "failed to mirror the OpenClaw base image."
-  fi
-
-  log "Mirroring ${PYTHON_UPSTREAM_IMAGE}"
-  log "       -> ${REGISTRY}/${PYTHON_ECR_REPO}:${PYTHON_ECR_TAG}"
-  if ! docker buildx imagetools create \
-        --tag "${REGISTRY}/${PYTHON_ECR_REPO}:${PYTHON_ECR_TAG}" \
-        "$PYTHON_UPSTREAM_IMAGE" >&2; then
-    fail "Mirror base images" "failed to mirror the Python base image."
+  if ! AWS_REGION="$AWS_REGION" \
+       AWS_ACCOUNT_ID="$AWS_ACCOUNT_ID" \
+       REGISTRY="$REGISTRY" \
+       OPENCLAW_UPSTREAM_IMAGE="$OPENCLAW_UPSTREAM_IMAGE" \
+       OPENCLAW_ECR_REPO="$OPENCLAW_ECR_REPO" \
+       OPENCLAW_ECR_TAG="$OPENCLAW_ECR_TAG" \
+       PYTHON_UPSTREAM_IMAGE="$PYTHON_UPSTREAM_IMAGE" \
+       PYTHON_ECR_REPO="$PYTHON_ECR_REPO" \
+       PYTHON_ECR_TAG="$PYTHON_ECR_TAG" \
+       bash "$MIRROR_BASE_IMAGES_SCRIPT" >/dev/null; then
+    fail "Mirror base images"
   fi
 
   log "Base images mirrored to ECR."

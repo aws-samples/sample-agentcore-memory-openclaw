@@ -239,9 +239,10 @@ ARG PYTHON_BASE_IMAGE=${ECR_REGISTRY}/python:3.12-slim
 
 ### Automatic (deploy script)
 
-`scripts/deploy.sh` handles this for you. Before building, it mirrors both
+`scripts/deploy.sh` handles this for you. Before building, its mirror stage runs
+[`scripts/mirror-base-images.sh`](scripts/mirror-base-images.sh) to copy both
 upstream images into your account's ECR (repositories `openclaw/openclaw` and
-`python`) and builds with
+`python`), then builds with
 `--build-arg ECR_REGISTRY=<account>.dkr.ecr.<region>.amazonaws.com`.
 `docker buildx imagetools create` copies each manifest verbatim, so the OpenClaw
 digest pin is preserved through the mirror. No extra action is needed beyond
@@ -249,29 +250,17 @@ running the deploy script.
 
 ### Manual (one-time mirror)
 
-If you build the image yourself, mirror the base images once, then build with the
-registry arg:
+If you build the image yourself, run the mirror helper once, then build with the
+registry arg. [`scripts/mirror-base-images.sh`](scripts/mirror-base-images.sh)
+creates the destination repositories (`openclaw/openclaw` and `python`),
+authenticates to your ECR, and copies both upstream images in with
+`docker buildx imagetools create` (which preserves the OpenClaw digest pin). It
+prints the resolved registry on stdout — with progress on stderr — so you can
+capture it straight into the build:
 
 ```bash
-ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-REGION="us-east-1"
-REGISTRY="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
-
-# Create the destination repositories (idempotent)
-aws ecr create-repository --repository-name openclaw/openclaw --region "$REGION" || true
-aws ecr create-repository --repository-name python --region "$REGION" || true
-
-# Authenticate to your ECR
-aws ecr get-login-password --region "$REGION" \
-  | docker login --username AWS --password-stdin "$REGISTRY"
-
-# Mirror the upstream images (imagetools preserves the OpenClaw digest pin)
-docker buildx imagetools create \
-  --tag "${REGISTRY}/openclaw/openclaw:2026.2.26" \
-  ghcr.io/openclaw/openclaw:2026.2.26@sha256:ce9347548afa0b6bdd1d262060535ba04baf0b19cde0fc211c8039492647d1b1
-docker buildx imagetools create \
-  --tag "${REGISTRY}/python:3.12-slim" \
-  python:3.12-slim
+# Mirror the base images and capture the resolved ECR registry
+REGISTRY="$(./scripts/mirror-base-images.sh)"
 
 # Build against the mirrored base images
 docker buildx build --platform linux/arm64 \
@@ -281,8 +270,14 @@ docker buildx build --platform linux/arm64 \
   --push .
 ```
 
-To bump the OpenClaw version later, re-mirror the new tag + digest, update the
-pinned values in the Dockerfile, and re-run your container image scan.
+The mirror resolves your account via `aws sts get-caller-identity` and targets
+`us-east-1` by default; override with `AWS_REGION`, `AWS_ACCOUNT_ID`, or the
+`*_UPSTREAM_IMAGE` / `*_ECR_REPO` / `*_ECR_TAG` variables if needed (see the
+script header for the full list).
+
+To bump the OpenClaw version later, re-mirror the new tag + digest (via the
+`OPENCLAW_UPSTREAM_IMAGE` and `OPENCLAW_ECR_TAG` overrides), update the pinned
+values in the Dockerfile, and re-run your container image scan.
 
 ## Project Layout
 
@@ -293,6 +288,7 @@ pinned values in the Dockerfile, and re-run your container image scan.
 │                              #   community-skills.json, skills/
 ├── telegram-webhook/          # Webhook + cron Lambda handlers
 ├── scripts/deploy.sh          # Full deployment orchestrator (+ install-skills.sh)
+├── scripts/mirror-base-images.sh # Mirror upstream base images into your ECR (used by deploy.sh)
 ├── scripts/push-public-image.sh  # Build & push to public ECR (used by pre-push hook)
 ├── .githooks/pre-push         # Auto-updates public image when agent-container/ changes
 └── docs/                      # Configuration, troubleshooting, Telegram setup
