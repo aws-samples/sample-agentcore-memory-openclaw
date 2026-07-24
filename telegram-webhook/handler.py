@@ -743,6 +743,15 @@ def lambda_handler(
         "images": images,
         "attachments": attachments,
     }
+    # Telegram delivers a multi-photo "album" as separate updates that share a
+    # media_group_id; forward it (with this item's message_id) so the runtime can
+    # buffer the album and reply once instead of once per photo.
+    media_group_id = message.get("media_group_id")
+    if media_group_id is not None:
+        payload["media_group_id"] = str(media_group_id)
+        message_id = message.get("message_id")
+        if message_id is not None:
+            payload["message_id"] = str(message_id)
     client = runtime_client if runtime_client is not None else _get_runtime_client()
 
     try:

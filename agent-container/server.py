@@ -69,6 +69,7 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
@@ -114,6 +115,25 @@ DEFAULT_VISION_MODEL = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 CRON_SCHEDULER_ROLE_ARN_ENV = "CRON_SCHEDULER_ROLE_ARN"
 CRON_INVOKER_FUNCTION_ARN_ENV = "CRON_INVOKER_FUNCTION_ARN"
 CRON_SCHEDULER_GROUP_ENV = "CRON_SCHEDULER_GROUP"
+
+# --- Album (multi-photo) grouping --------------------------------------------
+# Telegram delivers an "album" (several photos sent together) as N separate
+# webhook updates that share a media_group_id — there is no single multi-photo
+# message. To answer once and save the album as one backyard section, each item
+# is buffered in the S3 workspace bucket under an album prefix; after a short
+# debounce a single invocation atomically "claims" the group (S3 conditional
+# PutObject) and processes all photos in one turn. The others return an empty
+# reply so Telegram receives nothing from them.
+MEDIA_GROUP_ID_KEY = "media_group_id"
+MESSAGE_ID_KEY = "message_id"
+ALBUM_S3_PREFIX = "albums"
+# Debounce window (seconds) to wait for the rest of an album to arrive before
+# claiming/processing it. Telegram sends album items within ~1s; 2s is safe.
+ALBUM_DEBOUNCE_SECONDS_ENV = "ALBUM_DEBOUNCE_SECONDS"
+DEFAULT_ALBUM_DEBOUNCE_SECONDS = 2.0
+# Cap on the number of images forwarded to the model for one album (Claude
+# accepts up to 20 images; a Telegram album is at most 10).
+MAX_ALBUM_IMAGES = 15
 
 # The invocation_type value the Cron (invoker) Lambda sends for scheduled fires.
 CRON_INVOCATION_TYPE = "cron"
@@ -423,6 +443,39 @@ def build_cron_nudge_prompt(task_type: str) -> str:
         "you remember about them and their plants (above). Always write the "
         f"reminder — do NOT reply {NOTHING_DUE_SENTINEL} and do not skip it, "
         "even if you have no stored context about this specific task."
+    )
+
+
+def build_album_prompt(section_caption: str, num_photos: int) -> str:
+    """Build the single grouped-turn instruction for a photo album (pure).
+
+    When the gardener sends several photos of a backyard area together, they
+    arrive as one album. This composes one instruction covering all of them so
+    the model replies once and saves them as a single section — using the album
+    caption as the section name when present, or asking for one when absent.
+
+    Args:
+        section_caption: The album caption (first non-empty), or ``""``.
+        num_photos: How many photos are in the album.
+
+    Returns:
+        The user-message string for the single grouped album turn.
+    """
+    caption = (section_caption or "").strip()
+    count = max(int(num_photos or 0), 1)
+    if caption:
+        return (
+            f"{caption}\n\n[The gardener sent {count} photos together as one album "
+            "of a single backyard area. Identify the plants and beddings across ALL "
+            "the photos and remember them together as one section named from the "
+            "caption above. Reply once with a single grouped summary of the whole "
+            "section — do not describe the photos one by one.]"
+        )
+    return (
+        f"[The gardener sent {count} photos together as one album of a single "
+        "backyard area, with no caption. Identify the plants and beddings across "
+        "ALL the photos, reply once with a single grouped summary, and ask the "
+        "gardener what to name this section/region so you can save it together.]"
     )
 
 
@@ -1251,6 +1304,168 @@ class WorkspaceStore:
 
 
 # =============================================================================
+# Album (multi-photo) buffering — testable S3 key derivation + coordination
+# =============================================================================
+def _album_token(value: str) -> str:
+    """Sanitize a token used in an album S3 key to a safe charset.
+
+    chat_id / media_group_id / message_id come from Telegram; restricting them to
+    ``[0-9A-Za-z._-]`` keeps them safe as S3 key segments (no traversal, no
+    control chars) even though S3 keys are not filesystem paths.
+    """
+    return _re.sub(r"[^0-9A-Za-z._-]+", "-", (value or "").strip()).strip("-") or "x"
+
+
+def album_prefix(chat_id: str, media_group_id: str) -> str:
+    """S3 key prefix holding all buffered items for one album."""
+    return f"{ALBUM_S3_PREFIX}/{_album_token(chat_id)}/{_album_token(media_group_id)}/"
+
+
+def album_item_key(chat_id: str, media_group_id: str, message_id: str) -> str:
+    """S3 key for a single buffered album item (one per Telegram message)."""
+    return f"{album_prefix(chat_id, media_group_id)}items/{_album_token(message_id)}.json"
+
+
+def album_claim_key(chat_id: str, media_group_id: str) -> str:
+    """S3 key of the atomic claim marker electing the album's single processor."""
+    return f"{album_prefix(chat_id, media_group_id)}claimed"
+
+
+class AlbumBuffer:
+    """Buffers Telegram album items in S3 and elects one processor per album.
+
+    Uses the existing workspace bucket (no new infrastructure). Each item is a
+    small JSON object under ``albums/{chat_id}/{media_group_id}/items/``; a single
+    invocation wins the album by atomically creating the ``claimed`` marker via an
+    S3 conditional ``PutObject`` (``IfNoneMatch='*'``), which S3 fails with
+    ``PreconditionFailed`` for everyone else. S3's strong read-after-write
+    consistency makes the post-debounce listing see every item written so far.
+    """
+
+    def __init__(
+        self,
+        bucket: Optional[str],
+        *,
+        client: Optional[Any] = None,
+        debounce_seconds: float = DEFAULT_ALBUM_DEBOUNCE_SECONDS,
+    ) -> None:
+        self._bucket = bucket
+        self._client = client
+        self._debounce_seconds = debounce_seconds
+
+    @classmethod
+    def from_env(cls, *, client: Optional[Any] = None) -> Optional["AlbumBuffer"]:
+        """Build from ``WORKSPACE_BUCKET``; ``None`` when unset (grouping off)."""
+        bucket = os.environ.get(WORKSPACE_BUCKET_ENV)
+        if not bucket:
+            return None
+        try:
+            debounce = float(
+                os.environ.get(
+                    ALBUM_DEBOUNCE_SECONDS_ENV, DEFAULT_ALBUM_DEBOUNCE_SECONDS
+                )
+            )
+        except (TypeError, ValueError):
+            debounce = DEFAULT_ALBUM_DEBOUNCE_SECONDS
+        return cls(bucket, client=client, debounce_seconds=debounce)
+
+    def _s3(self) -> Any:
+        if self._client is None:
+            import boto3
+
+            self._client = boto3.client("s3")
+        return self._client
+
+    def wait_debounce(self) -> None:
+        """Sleep the debounce window so sibling album items can arrive."""
+        if self._debounce_seconds > 0:
+            time.sleep(self._debounce_seconds)
+
+    def record_item(
+        self, chat_id: str, media_group_id: str, message_id: str, item: dict[str, Any]
+    ) -> None:
+        """Persist one album item (idempotent per message_id)."""
+        self._s3().put_object(
+            Bucket=self._bucket,
+            Key=album_item_key(chat_id, media_group_id, message_id),
+            Body=json.dumps(item).encode("utf-8"),
+            ContentType="application/json",
+        )
+
+    def try_claim(self, chat_id: str, media_group_id: str) -> bool:
+        """Atomically claim the album; ``True`` for the single winner.
+
+        Uses an S3 conditional create (``IfNoneMatch='*'``). Returns ``False``
+        only when the marker already exists (``PreconditionFailed`` — another
+        invocation won). On any other error it degrades to ``True`` (process and
+        reply) so an unexpected S3 issue never leaves the album silent — worst
+        case reverts to the pre-grouping behavior of replying per item.
+        """
+        try:
+            self._s3().put_object(
+                Bucket=self._bucket,
+                Key=album_claim_key(chat_id, media_group_id),
+                Body=b"1",
+                IfNoneMatch="*",
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 — inspect for the 412 precondition.
+            code = None
+            response = getattr(exc, "response", None)
+            if isinstance(response, dict):
+                code = response.get("Error", {}).get("Code")
+            if code in ("PreconditionFailed", "412"):
+                return False
+            logger.warning(
+                "Album claim non-precondition error (processing anyway): %s", exc
+            )
+            return True
+
+    def list_items(self, chat_id: str, media_group_id: str) -> list[dict[str, Any]]:
+        """Return all buffered items for the album, ordered by message id."""
+        prefix = album_prefix(chat_id, media_group_id) + "items/"
+        items: list[dict[str, Any]] = []
+        try:
+            client = self._s3()
+            paginator = client.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix):
+                for obj in page.get("Contents", []) or []:
+                    body = client.get_object(Bucket=self._bucket, Key=obj["Key"])[
+                        "Body"
+                    ].read()
+                    try:
+                        items.append(json.loads(body))
+                    except (ValueError, TypeError):
+                        continue
+        except Exception:  # noqa: BLE001 — degrade to whatever was read.
+            logger.warning("Album listing failed; using partial items", exc_info=True)
+
+        def _key(it: dict[str, Any]) -> tuple[int, str]:
+            mid = str(it.get("message_id", ""))
+            return (int(mid), mid) if mid.lstrip("-").isdigit() else (1 << 62, mid)
+
+        return sorted(items, key=_key)
+
+    def cleanup(self, chat_id: str, media_group_id: str) -> None:
+        """Best-effort delete of the album's buffered items and claim marker."""
+        prefix = album_prefix(chat_id, media_group_id)
+        try:
+            client = self._s3()
+            paginator = client.get_paginator("list_objects_v2")
+            keys = [
+                {"Key": obj["Key"]}
+                for page in paginator.paginate(Bucket=self._bucket, Prefix=prefix)
+                for obj in (page.get("Contents", []) or [])
+            ]
+            for i in range(0, len(keys), 1000):
+                client.delete_objects(
+                    Bucket=self._bucket, Delete={"Objects": keys[i : i + 1000]}
+                )
+        except Exception:  # noqa: BLE001 — cleanup is best-effort.
+            logger.debug("Album cleanup failed (non-fatal)", exc_info=True)
+
+
+# =============================================================================
 # Proactive scheduling via EventBridge Scheduler
 # =============================================================================
 class SproutScheduler:
@@ -1734,6 +1949,7 @@ class SproutRuntime:
         base_persona: str,
         model_id: str,
         scheduler: Optional[SproutScheduler] = None,
+        album_buffer: Optional[AlbumBuffer] = None,
         workspace_root: str = "/tmp/sprout-workspace",
     ) -> None:
         """Initialize the runtime with its collaborators.
@@ -1746,6 +1962,9 @@ class SproutRuntime:
             model_id: The Bedrock model id (surfaced in response metadata).
             scheduler: The proactive-reminder scheduler, or ``None`` when
                 scheduling is not configured (env vars unset).
+            album_buffer: The S3-backed album buffer for grouping multi-photo
+                Telegram albums into one reply, or ``None`` when disabled (no
+                workspace bucket) — each photo is then handled individually.
             workspace_root: The local root under which per-chat workspaces live.
         """
         self._memory = memory
@@ -1754,6 +1973,7 @@ class SproutRuntime:
         self._base_persona = base_persona
         self._model_id = model_id
         self._scheduler = scheduler
+        self._album_buffer = album_buffer
         self._workspace_root = workspace_root
 
     def handle_invocation(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1792,6 +2012,32 @@ class SproutRuntime:
         invocation_type = str(payload.get("invocation_type", "")).strip().lower()
         is_cron = invocation_type == CRON_INVOCATION_TYPE
         task_type = str(payload.get("task_type") or message or "scheduled_check").strip()
+
+        # 1b. Album grouping: when this message is part of a Telegram photo album
+        #     (media_group_id present), buffer it and let a single invocation
+        #     process the whole album once. Non-winners return an empty reply so
+        #     Telegram receives nothing from them. The winner continues below
+        #     with the merged caption + all album images.
+        media_group_id = payload.get(MEDIA_GROUP_ID_KEY)
+        if media_group_id and not is_cron and self._album_buffer is not None:
+            assembled_album = self._assemble_album(chat_id, str(media_group_id), payload)
+            if assembled_album is None:
+                logger.info(
+                    "Album %s: buffered item, another invocation will reply",
+                    media_group_id,
+                )
+                return {
+                    "ok": True,
+                    "text": "",
+                    "metadata": {
+                        "invocation_type": invocation_type or "webhook",
+                        "album_role": "buffered",
+                        "media_group_id": str(media_group_id),
+                        "session_id": session_id,
+                        "transcript_persisted": False,
+                    },
+                }
+            message, images = assembled_album
 
         # 2. Workspace download (graceful degradation, Req 9.2, 9.4). chat_id is
         #    allowlist-validated above; resolve_within is a second barrier that
@@ -1998,6 +2244,67 @@ class SproutRuntime:
             )
         return created
 
+    def _assemble_album(
+        self, chat_id: str, media_group_id: str, payload: dict[str, Any]
+    ) -> Optional[tuple[str, list[dict[str, Any]]]]:
+        """Buffer this album item and, for the single winner, return the group.
+
+        Records the current item, waits the debounce window for siblings, then
+        atomically claims the album. The one invocation that wins the claim
+        returns ``(merged_message, all_images)`` — the merged caption plus every
+        album photo (capped at :data:`MAX_ALBUM_IMAGES`) — and the rest return
+        ``None`` so the caller replies with nothing for them.
+
+        Args:
+            chat_id: The Telegram chat id (album owner).
+            media_group_id: The Telegram album identifier.
+            payload: This item's invocation payload (``message``/caption,
+                ``images``, ``message_id``).
+
+        Returns:
+            ``(message, images)`` for the album's single processor, or ``None``
+            for a buffered (non-winning) item.
+        """
+        buffer = self._album_buffer
+        message_id = str(payload.get(MESSAGE_ID_KEY) or uuid.uuid4().hex)
+        item = {
+            "message_id": message_id,
+            "caption": str(payload.get("message", "")),
+            "images": payload.get("images") if isinstance(payload.get("images"), list) else [],
+        }
+        try:
+            buffer.record_item(chat_id, media_group_id, message_id, item)
+        except Exception:  # noqa: BLE001 — if buffering fails, fall back to
+            # handling this single item normally rather than dropping it.
+            logger.warning("Album buffering failed; handling item individually", exc_info=True)
+            return str(payload.get("message", "")), item["images"]
+
+        buffer.wait_debounce()
+        if not buffer.try_claim(chat_id, media_group_id):
+            return None
+
+        items = buffer.list_items(chat_id, media_group_id)
+        all_images: list[dict[str, Any]] = []
+        captions: list[str] = []
+        for entry in items:
+            for img in entry.get("images") or []:
+                if len(all_images) < MAX_ALBUM_IMAGES:
+                    all_images.append(img)
+            caption = (entry.get("caption") or "").strip()
+            if caption:
+                captions.append(caption)
+        buffer.cleanup(chat_id, media_group_id)
+
+        section_caption = captions[0] if captions else ""
+        merged_message = build_album_prompt(section_caption, len(all_images))
+        logger.info(
+            "Album %s claimed: %d photos, %d captions",
+            media_group_id,
+            len(all_images),
+            len(captions),
+        )
+        return merged_message, all_images
+
 
 def _error_envelope(error: str, message: str) -> dict[str, Any]:
     """Build a non-raising error envelope for the host.
@@ -2052,6 +2359,7 @@ def get_runtime() -> SproutRuntime:
             base_persona=load_base_persona(),
             model_id=model_id,
             scheduler=SproutScheduler.from_env(),
+            album_buffer=AlbumBuffer.from_env(),
         )
     return _runtime
 
