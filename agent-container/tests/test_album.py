@@ -126,14 +126,21 @@ def test_list_items_returns_all_ordered_by_message_id():
     assert [it["message_id"] for it in items] == ["1", "2", "10"]
 
 
-def test_cleanup_removes_album_objects():
+def test_cleanup_removes_items_but_keeps_claim_marker():
     client = FakeS3()
     buf = _buffer(client)
     buf.record_item("12345", "g1", "1", {"message_id": "1", "caption": "", "images": []})
-    buf.try_claim("12345", "g1")
-    assert any(k.startswith("albums/12345/g1/") for k in client.store)
+    assert buf.try_claim("12345", "g1") is True
+    assert any(k.startswith("albums/12345/g1/items/") for k in client.store)
+
     buf.cleanup("12345", "g1")
-    assert not any(k.startswith("albums/12345/g1/") for k in client.store)
+
+    # Buffered items are gone...
+    assert not any(k.startswith("albums/12345/g1/items/") for k in client.store)
+    # ...but the claim marker remains so a late sibling cannot re-claim and
+    # reprocess an emptied album (exactly-once reply).
+    assert album_claim_key("12345", "g1") in client.store
+    assert buf.try_claim("12345", "g1") is False
 
 
 # =============================================================================

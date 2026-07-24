@@ -1447,8 +1447,16 @@ class AlbumBuffer:
         return sorted(items, key=_key)
 
     def cleanup(self, chat_id: str, media_group_id: str) -> None:
-        """Best-effort delete of the album's buffered items and claim marker."""
-        prefix = album_prefix(chat_id, media_group_id)
+        """Best-effort delete of the album's buffered items.
+
+        Deletes only the ``items/`` objects, NOT the ``claimed`` marker: keeping
+        the marker means a sibling invocation that reaches ``try_claim`` after the
+        winner has already processed still loses the claim (exactly-once reply)
+        instead of re-claiming an emptied album. The small marker is expired by
+        the bucket's ``albums/`` lifecycle rule (media_group_id is unique per
+        album, so it is never reused within that window).
+        """
+        prefix = album_prefix(chat_id, media_group_id) + "items/"
         try:
             client = self._s3()
             paginator = client.get_paginator("list_objects_v2")
