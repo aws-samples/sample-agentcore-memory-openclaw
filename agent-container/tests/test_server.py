@@ -280,6 +280,67 @@ def test_handle_invocation_rejects_invalid_user_id(payload):
 
 
 # =============================================================================
+# Path-injection defenses (CWE-22 / CodeQL py/path-injection)
+# =============================================================================
+@pytest.mark.parametrize(
+    "bad_id",
+    ["../../etc/passwd", "12345/../../secret", "a b", "foo", "12/34", "..", "12345\x00"],
+)
+def test_handle_invocation_rejects_traversal_user_id(bad_id):
+    """A non-numeric / path-traversal user_id is rejected (never reaches disk)."""
+    memory = FakeMemory()
+    workspace = FakeWorkspace()
+    agent = FakeAgent()
+    runtime = _make_runtime(memory=memory, workspace=workspace, agent=agent)
+
+    result = runtime.handle_invocation({"user_id": bad_id, "message": "hi"})
+
+    assert result["ok"] is False
+    assert result["error"] == "INVALID_USER_ID"
+    # Rejected before any workspace/memory/agent work.
+    assert workspace.calls == []
+    assert memory.calls == []
+    assert agent.calls == []
+
+
+def test_is_valid_chat_id_allows_only_integers():
+    assert server.is_valid_chat_id("12345")
+    assert server.is_valid_chat_id("-1001234567890")  # Telegram group id
+    assert not server.is_valid_chat_id("../../etc")
+    assert not server.is_valid_chat_id("12345/6")
+    assert not server.is_valid_chat_id("")
+    assert not server.is_valid_chat_id("abc")
+
+
+def test_resolve_within_blocks_escape(tmp_path):
+    base = str(tmp_path)
+    # A benign relative path resolves inside base.
+    inside = server.resolve_within(base, "sub", "file.txt")
+    assert inside.startswith(os.path.realpath(base) + os.sep)
+    # Traversal escapes are rejected.
+    for evil in ("../outside", "../../etc/passwd", "/etc/passwd"):
+        with pytest.raises(ValueError):
+            server.resolve_within(base, evil)
+
+
+def test_workspace_download_skips_unsafe_s3_key():
+    """A crafted S3 object key containing '..' is skipped, not written outside."""
+    class _EvilKeyClient:
+        def get_paginator(self, _op):
+            class _P:
+                def paginate(self, **_kw):
+                    return [{"Contents": [{"Key": "workspace/12345/../../escape.txt"}]}]
+            return _P()
+
+        def download_file(self, *_a, **_k):  # pragma: no cover - must not run
+            raise AssertionError("download_file called for an unsafe key")
+
+    store = WorkspaceStore(bucket="b", client=_EvilKeyClient())
+    # Should return True (graceful) and NOT call download_file for the bad key.
+    assert store.download("12345", "/tmp/sprout-cwe22-test") is True
+
+
+# =============================================================================
 # Agent error handling -> AGENT_ERROR envelope
 # =============================================================================
 def test_handle_invocation_agent_exception_returns_agent_error():

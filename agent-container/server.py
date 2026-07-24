@@ -64,6 +64,7 @@ Environment variables (UPPER_SNAKE_CASE per project standards)
 from __future__ import annotations
 
 import base64
+import re as _re
 import json
 import logging
 import os
@@ -214,6 +215,63 @@ def chat_id_from_namespace(namespace: str) -> str:
     if len(parts) >= 3 and parts[0] == NAMESPACE_ROOT:
         return parts[1]
     return ""
+
+
+# =============================================================================
+# Path-injection defenses (chat id validation + directory containment)
+# =============================================================================
+# The Telegram ``chat_id`` (and, on download, S3 object keys) are attacker-
+# influenced values that end up in filesystem paths for the per-user workspace.
+# Without validation a value like ``../../etc`` could traverse outside the
+# workspace root (CWE-22 / CodeQL py/path-injection). Two barriers guard this:
+#   1. ``is_valid_chat_id`` — an allowlist so an id used as a path segment / S3
+#      prefix cannot contain separators or ``..``. Telegram chat ids are signed
+#      integers (negative for groups), so the safe charset is ``^-?[0-9]+$``.
+#   2. ``resolve_within`` — normalizes a joined path and verifies it stays inside
+#      the intended base directory, so a crafted S3 key can't escape on download.
+_SAFE_CHAT_ID_RE = _re.compile(r"^-?[0-9]+$")
+
+
+def is_valid_chat_id(chat_id: str) -> bool:
+    """Return ``True`` when ``chat_id`` is a safe Telegram chat identifier.
+
+    Telegram chat ids are integers (negative for group/channel chats). Enforcing
+    this allowlist means the id is safe to embed in a filesystem path segment,
+    an S3 key prefix, and a memory namespace — it cannot contain ``/``, ``\\``,
+    ``..``, NUL, or other traversal characters (CWE-22 defense).
+
+    Args:
+        chat_id: The candidate chat id (already stripped).
+
+    Returns:
+        ``True`` when the id matches ``^-?[0-9]+$``.
+    """
+    return bool(_SAFE_CHAT_ID_RE.match(chat_id or ""))
+
+
+def resolve_within(base_dir: str, *segments: str) -> str:
+    """Join ``segments`` under ``base_dir`` and confirm the result stays inside.
+
+    Defends against path traversal (CWE-22) when an attacker-influenced value
+    (a chat id, or an S3 object key on download) is used to build a local path:
+    the joined path is normalized with :func:`os.path.realpath` and verified to
+    be the base directory itself or a descendant of it.
+
+    Args:
+        base_dir: The directory the result must remain within.
+        *segments: Path segments to join under ``base_dir``.
+
+    Returns:
+        The absolute, normalized path.
+
+    Raises:
+        ValueError: When the joined path escapes ``base_dir``.
+    """
+    base = os.path.realpath(base_dir)
+    candidate = os.path.realpath(os.path.join(base, *segments))
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise ValueError("resolved path escapes the base directory")
+    return candidate
 
 
 # =============================================================================
@@ -398,8 +456,7 @@ def interpret_cron_response(text: str) -> str:
 # EventBridge Scheduler reminders, and strips the directive(s) from the text
 # before it is shown to the user. Only at()/rate()/cron() expressions are
 # accepted so a stray/hallucinated tag can't produce a bogus schedule call.
-import re as _re  # module-level alias; ``re`` is otherwise imported lazily.
-
+# (``re`` is aliased as ``_re`` in the top-level imports.)
 _SCHEDULE_TAG_RE = _re.compile(r"\[\[SCHEDULE\b[^\]]*?\]\]", _re.IGNORECASE | _re.DOTALL)
 _SCHEDULE_EXPR_RE = _re.compile(r'expr\s*=\s*"([^"]*)"', _re.IGNORECASE)
 _SCHEDULE_TASK_RE = _re.compile(r'task\s*=\s*"([^"]*)"', _re.IGNORECASE)
@@ -1146,7 +1203,15 @@ class WorkspaceStore:
                     relative = key[len(prefix):]
                     if not relative:
                         continue
-                    target = os.path.join(dest_dir, relative)
+                    # Guard against a crafted S3 object key (e.g. containing
+                    # ``..``) escaping dest_dir on write (CWE-22).
+                    try:
+                        target = resolve_within(dest_dir, relative)
+                    except ValueError:
+                        logger.warning(
+                            "Skipping workspace object with unsafe key: %r", key
+                        )
+                        continue
                     os.makedirs(os.path.dirname(target) or dest_dir, exist_ok=True)
                     client.download_file(self._bucket, key, target)
             return True
@@ -1709,6 +1774,12 @@ class SproutRuntime:
             logger.warning("Rejecting invocation: missing user_id")
             return _error_envelope("INVALID_USER_ID", "A non-empty user_id is required.")
         chat_id = chat_id.strip()
+        # Enforce the Telegram chat-id allowlist so the id is safe to use as a
+        # filesystem path segment / S3 key prefix / memory namespace (prevents
+        # path traversal, CWE-22 / CodeQL py/path-injection).
+        if not is_valid_chat_id(chat_id):
+            logger.warning("Rejecting invocation: malformed user_id")
+            return _error_envelope("INVALID_USER_ID", "A valid numeric user_id is required.")
 
         message = str(payload.get("message", ""))
         session_id = payload.get("session_id") or uuid.uuid4().hex
@@ -1722,8 +1793,10 @@ class SproutRuntime:
         is_cron = invocation_type == CRON_INVOCATION_TYPE
         task_type = str(payload.get("task_type") or message or "scheduled_check").strip()
 
-        # 2. Workspace download (graceful degradation, Req 9.2, 9.4).
-        workspace_dir = os.path.join(self._workspace_root, chat_id)
+        # 2. Workspace download (graceful degradation, Req 9.2, 9.4). chat_id is
+        #    allowlist-validated above; resolve_within is a second barrier that
+        #    keeps the workspace dir inside the root (CWE-22 defense).
+        workspace_dir = resolve_within(self._workspace_root, chat_id)
         self._workspace.download(chat_id, workspace_dir)
 
         # 3. Retrieve + 4. assemble memory context (Req 5.1-5.5).
