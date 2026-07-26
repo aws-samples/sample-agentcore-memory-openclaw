@@ -180,6 +180,14 @@ Resources:
                   - s3:ListBucket
                 Resource:
                   - !Sub 'arn:aws:s3:::${AWS::StackName}-workspace-${AWS::AccountId}'
+              # DeleteObject is scoped to the transient album-buffer prefix only
+              # (multi-photo grouping cleanup) — the runtime cannot delete a
+              # user's persisted workspace objects.
+              - Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${AWS::StackName}-workspace-${AWS::AccountId}/albums/*'
         - PolicyName: KMSDecrypt
           PolicyDocument:
             Version: '2012-10-17'
@@ -564,6 +572,18 @@ Resources:
         RestrictPublicBuckets: true
       VersioningConfiguration:
         Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          # Safety net for the transient multi-photo album buffer: the runtime
+          # deletes these objects after grouping, but expire anything left
+          # behind (e.g. an album that never completed) so they never
+          # accumulate. 1 day is well beyond the seconds-long album window.
+          - Id: ExpireAlbumBuffer
+            Status: Enabled
+            Prefix: albums/
+            ExpirationInDays: 1
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
 
   WorkspaceBucketPolicy:
     Type: AWS::S3::BucketPolicy
