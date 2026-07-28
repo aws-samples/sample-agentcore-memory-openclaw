@@ -66,11 +66,15 @@ export STACK_NAME="mygarden"
 scripts/deploy.sh
 ```
 
-### Option B — CloudFormation console / Launch Stack button
+### Option B — CloudFormation console / CLI
 
-If you deploy through the AWS console (including via the README's **Launch Stack** button),
-paste the token into the **TelegramBotToken** parameter field on the stack parameters page.
-Because the field is `NoEcho`, it is masked as you type and is not displayed afterward.
+If you deploy the template directly through the AWS console or CLI, paste the token into the
+**TelegramBotToken** parameter field on the stack parameters page. Because the field is
+`NoEcho`, it is masked as you type and is not displayed afterward.
+
+Note that this path also requires you to supply a working **ContainerImageUri** — the default
+is a placeholder, since this sample does not publish a prebuilt image. Build and push the
+agent image to your own ECR first (the deploy script does this for you).
 
 When deploying through the console, the webhook is **not** registered automatically. After
 the stack reaches `CREATE_COMPLETE`, copy the `WebhookUrl` from the stack **Outputs** and

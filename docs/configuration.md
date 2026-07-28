@@ -19,11 +19,13 @@ runs before any resources are created, so an out-of-range value is rejected up f
 | `MonthlyBudgetLimit` | Number | `25` | Between `1` and `10000` | Monthly budget ceiling in USD. Drives the AWS Budgets resource that raises alerts at 80% and 100% of this amount. |
 | `AlertEmail` | String | `''` (empty) | Valid email address, or empty | Email address subscribed to the SNS alert topic for budget and operational alarms. Leave empty to create the topic and alarms without an email subscription. |
 | `LogRetentionDays` | Number | `30` | One of `1, 3, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400` | Retention period, in days, for the CloudWatch log groups of the webhook Lambda, cron Lambda, and AgentCore Runtime. |
+| `ContainerImageUri` | String | `public.ecr.aws/<ECR_PUBLIC_ALIAS>/sprout-agent:latest` | Any container image URI | Agent container image for the AgentCore Runtime. **The default is a placeholder, not a working image** — this sample publishes no prebuilt image, so each operator builds and hosts their own. `scripts/deploy.sh` overrides this with the image it builds and pushes to ECR in your account; supply your own URI when deploying the template directly. |
 
 ### How parameters are supplied
 
-- **CloudFormation console / Launch Stack button** — each parameter appears as a field
-  you fill in before creating the stack.
+- **CloudFormation console / CLI** — each parameter appears as a field you fill in before
+  creating the stack. This path also requires a working `ContainerImageUri` (the default is
+  a placeholder; see the note in the table above).
 - **`scripts/deploy.sh`** — the script reads most parameters from environment variables
   (`TELEGRAM_BOT_TOKEN`, `MODEL_ID`, `VISION_MODEL_ID`, `MONTHLY_BUDGET_LIMIT`,
   `ALERT_EMAIL`, `LOG_RETENTION_DAYS`) and passes them through as

@@ -45,7 +45,7 @@ cfn-lint openclaw-telegram.yaml
 
 | ID | Location | Finding | Disposition |
 |----|----------|---------|-------------|
-| W1030 | `AgentCoreRuntime` `ContainerUri` | Default value doesn't match the private-ECR URI regex | **Expected.** The default is a **public** ECR URI (`public.ecr.aws/...`) for the one-click Launch Stack; `deploy.sh` overrides it with a private ECR URI for local builds. Warning only, no error. |
+| W1030 | `AgentCoreRuntime` `ContainerUri` | Default value doesn't match the private-ECR URI regex | **Expected.** The default is a non-functional `public.ecr.aws/<ECR_PUBLIC_ALIAS>/...` placeholder (this sample publishes no prebuilt image); `deploy.sh` overrides it with the private ECR URI it builds and pushes. Warning only, no error. |
 
 ## detect-secrets
 

@@ -174,7 +174,7 @@ are called out explicitly (PCSR reviewers of GenAI content expect this).
 | SC-1 | OpenClaw container / Node dependency vulnerabilities | Medium–High | OpenClaw is pinned to `2026.2.26` (tag+digest) — the release compatible with the Bedrock inference-profile model ids this project requires (newer builds dropped that support, OpenClaw issue #55642). A trivy scan of that base shows a high third-party CVE count: the Debian OS layer (173 CRIT / 1091 HIGH) is **not shipped** (final image rebuilds on `python:3.12-slim` + `apt upgrade`, copying only `/app`), but the Node layer (19 CRIT / 220 HIGH) and Go dev binaries (26 HIGH) in `/app` **do** ship. Blast radius is bounded: gateway is loopback-only behind a bearer token and the runtime IAM role is least-privilege. Remediation options in `security-scans/README.md`. **Requires Guardian review of the version tradeoff.** | Partial — open |
 | SC-2 | Python dependency vulnerabilities (boto3, requests) | Low | Minimal dependency surface; pin versions in `requirements.txt`; rely on q-scanner/Probe/`pip-audit` in the review pipeline. | Partial |
 | SC-3 | Typosquatting / malicious package | Low | Only well-known packages (`boto3`, `requests`); no unusual transitive additions. | Mitigated |
-| SC-4 | Publicly hosted image URI (one-click deploy) points somewhere untrusted | Medium | For aws-samples, the published image must live in an AWS-owned ECR Public alias; `<ECR_PUBLIC_ALIAS>` is a placeholder to be replaced with the reviewed, AWS-owned repository before launch. | **Open — action required** |
+| SC-4 | Publicly hosted image URI (one-click deploy) points somewhere untrusted | Medium | Avoided by design: this sample publishes **no** prebuilt image and ships **no** one-click Launch Stack button. `ContainerImageUri` defaults to a non-functional `<ECR_PUBLIC_ALIAS>` placeholder, and `scripts/deploy.sh` overrides it with an image built and pushed into the deployer's own ECR — so operators only ever run an image they built. Re-opens if a prebuilt image is ever published, which would require an AWS-owned, scanned ECR Public repository. | Mitigated |
 
 ## 6. Required Scans (evidence for the PCSR ticket)
 
@@ -204,8 +204,10 @@ exported Slingshot results showing no remaining High/Critical).
    guarantee is *blast-radius limitation* via least-privilege IAM and code-level
    namespace isolation — the model is never the sole control for
    confidentiality or authorization.
-5. **Publicly hosted container image** must be an AWS-owned, scanned ECR Public
-   repository before the one-click Launch Stack is published (SC-4).
+5. **No prebuilt container image is published** with this sample, and there is no
+   one-click Launch Stack button; each operator builds and hosts the agent image
+   in their own account. Publishing a prebuilt image would require an AWS-owned,
+   scanned ECR Public repository and re-opens SC-4.
 6. This is **educational sample code**; production deployments should add
    WAF, per-user throttling, image digest pinning, and a formal data-retention
    review appropriate to their jurisdiction.
@@ -218,6 +220,6 @@ exported Slingshot results showing no remaining High/Critical).
 - [ ] `bandit`, `cfn-lint`, `checkov`, `detect-secrets`/`gitleaks`, `pip-audit` run; High/Critical remediated with evidence
 - [ ] Container image scanned; High/Critical remediated
 - [ ] Slingshot / CRUX / Probe results exported and attached
-- [ ] `<ECR_PUBLIC_ALIAS>` replaced with the AWS-owned, scanned ECR Public alias (SC-4)
+- [x] No prebuilt public image / no one-click Launch Stack shipped; `ContainerImageUri` left as a non-functional placeholder so operators build their own (SC-4)
 - [ ] LICENSE (MIT-0), NOTICE, and disclaimers verified (Appendix E)
 - [ ] BLL review for any Appendix C/D escalation clauses (GenAI use case)

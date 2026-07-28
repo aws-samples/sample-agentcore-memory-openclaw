@@ -13,19 +13,17 @@ template — no CDK, no build tooling required to launch.
 This repository is the companion to the blog post _"The Assistant That Remembers:
 Building a Context-Aware Personal AI with Amazon Bedrock AgentCore and OpenClaw."_
 
-## 🚀 Launch Stack
+## Deploying
 
-Deploy the whole thing in one click. The AWS CloudFormation console opens with the
-template parameters pre-populated for you to fill in (you'll need a Telegram bot
-token — see [Prerequisites](#prerequisites)).
+Deploy with the guided script — see [Quick Start](#quick-start). It builds the
+agent image, pushes it to ECR in your own account, deploys the stack, and
+registers the Telegram webhook for you.
 
-[![Launch Stack](https://s3.amazonaws.com/cloudformation-examples/cloudformation-launch-stack.png)](https://console.aws.amazon.com/cloudformation/home#/stacks/quickcreate?templateURL=https://raw.githubusercontent.com/aws-samples/sample-agentcore-memory-openclaw/main/openclaw-telegram.yaml&stackName=sprout)
-
-> The Launch Stack button uses a publicly hosted container image from Amazon ECR
-> Public, so it works immediately without building anything locally. After the
-> stack reaches `CREATE_COMPLETE`, register the webhook URL with Telegram (the
-> [deploy script](#option-a--guided-deploy-script-recommended) does this
-> automatically, or do it manually per Option B below).
+> There is intentionally no one-click "Launch Stack" button. That path requires a
+> prebuilt container image hosted in a public registry, and this sample does not
+> publish one: you build and host the image in your own account so you control
+> exactly what runs. See `ContainerImageUri` in
+> [Stack Parameters](#stack-parameters) if you deploy the template directly.
 
 ## Why Telegram (and why it's cheap)
 
@@ -178,8 +176,6 @@ text conversations reuse the cached prefix and pay only the reduced cache-read r
 
 ## Quick Start
 
-### Option A — Guided deploy script (recommended)
-
 The deploy script validates the template, builds and pushes the `linux/arm64`
 container image to ECR, creates or updates the stack, and registers the Telegram
 webhook for you — all in one command.
@@ -214,23 +210,19 @@ STACK_NAME="mygarden" MONTHLY_BUDGET_LIMIT="25" ./scripts/deploy.sh
 See `.env.example` for the full list of supported variables (region, model id,
 vision model, budget, log retention, alert email).
 
-### Option B — One-click Launch Stack
+### Deploying the template directly
 
-1. Click the [**Launch Stack**](#-launch-stack) button above.
-2. Fill in the `TelegramBotToken` parameter (and optionally `AlertEmail`, budget,
-   and model). Create the stack.
-3. After `CREATE_COMPLETE`, copy the `WebhookUrl` from the stack **Outputs** and
-   register it with Telegram:
+If you deploy `openclaw-telegram.yaml` through the CloudFormation console or CLI
+instead of the script, you must supply `ContainerImageUri` yourself — its default
+is a placeholder, not a working image. Build and push the image first (see
+[Mirroring base images to internal ECR](#mirroring-base-images-to-internal-ecr)),
+then pass that URI, and afterwards register the webhook manually:
 
-   ```bash
-   curl --get \
-     --data-urlencode "url=<WebhookUrl-from-stack-outputs>" \
-     "https://api.telegram.org/bot<your-bot-token>/setWebhook"
-   ```
-
-   > Note: the one-click path uses the public container image and works
-   > immediately. The deploy script (Option A) builds a private copy, which is
-   > useful for custom modifications.
+```bash
+curl --get \
+  --data-urlencode "url=<WebhookUrl-from-stack-outputs>" \
+  "https://api.telegram.org/bot<your-bot-token>/setWebhook"
+```
 
 ## Stack Parameters
 
@@ -242,6 +234,7 @@ vision model, budget, log retention, alert email).
 | `MonthlyBudgetLimit` | `25` | Monthly budget in USD (1–10000); alerts at 80% and 100% |
 | `AlertEmail` | _(empty)_ | Email for budget and operational alerts (optional) |
 | `LogRetentionDays` | `30` | CloudWatch log retention in days |
+| `ContainerImageUri` | _(placeholder)_ | Agent container image for the AgentCore Runtime. `scripts/deploy.sh` sets this to the image it builds and pushes to ECR in your account. The default is **not** a working image — supply your own when deploying the template directly. |
 
 ## Community Skills
 
@@ -335,15 +328,17 @@ values in the Dockerfile, and re-run your container image scan.
 
 ### Developer setup (one-time)
 
-To activate the pre-push hook that keeps the public container image in sync:
+If you maintain a fork that publishes its own prebuilt image, you can activate
+the optional pre-push hook that keeps that image in sync:
 
 ```bash
 git config core.hooksPath .githooks
 ```
 
 After this, any push to `main` that includes changes under `agent-container/`
-will automatically rebuild and push the public ECR image so the Launch Stack
-button always deploys the latest version.
+rebuilds and pushes the image to the registry you configure via `ECR_REGISTRY`
+and `PUBLIC_IMAGE` (see `scripts/push-public-image.sh`). This sample itself does
+not publish a prebuilt image, so the hook is off by default.
 
 ## License
 
