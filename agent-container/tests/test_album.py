@@ -149,13 +149,18 @@ def test_cleanup_removes_items_but_keeps_claim_marker():
 class _FakeMemory:
     def __init__(self):
         self.persisted = None
+        self.written_records = []
 
-    def retrieve(self, chat_id, query):
+    def retrieve(self, chat_id, query, *, metadata_filters=None):
         return []
 
     def persist(self, chat_id, session_id, messages):
         self.persisted = messages
         return True
+
+    def write_records(self, records):
+        self.written_records.extend(records)
+        return len(records)
 
 
 class _FakeWorkspace:

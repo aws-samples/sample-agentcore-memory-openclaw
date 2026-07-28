@@ -39,7 +39,9 @@ infrastructure cost down to roughly **$1–2/month** plus per-message model usag
 
 Sprout connects Telegram to an OpenClaw agent on AgentCore Runtime. AgentCore
 Memory stores session events and asynchronously extracts long-term records that
-get injected back into the agent's context at the start of each conversation.
+get injected back into the agent's context at the start of each conversation;
+registered garden sections are additionally written as structured records with
+queryable metadata (see [Two ways facts reach memory](#two-ways-facts-reach-memory)).
 For proactive reminders, the runtime creates EventBridge Scheduler schedules on
 demand — when you agree to a reminder — and each one later wakes a Cron Lambda
 that re-invokes the runtime to deliver a memory-driven nudge.
@@ -64,7 +66,7 @@ flowchart LR
     EB -->|reminder fires| CRON -->|InvokeAgentRuntime cron| RT
     CRON -->|sendMessage| TG
 
-    RT -->|RetrieveMemoryRecords / CreateEvent| MEM
+    RT -->|RetrieveMemoryRecords / CreateEvent<br/>BatchCreateMemoryRecords| MEM
     RT -->|workspace read/write| S3
     RT -->|InvokeModel| BR
     MEM -. async extraction .-> BR
@@ -79,7 +81,11 @@ flowchart LR
 3. `server.py` retrieves relevant memories from **AgentCore Memory**, injects them
    into OpenClaw's system prompt, runs the agent turn, then persists the
    transcript as an event (triggering async long-term extraction).
-4. **Proactive reminders** are created on demand: when the agent agrees to a
+4. **Registered garden sections** are also written as *structured* memory records
+   (see [Two ways facts reach memory](#two-ways-facts-reach-memory)): when you
+   send a captioned photo album of a bed, the runtime writes a record with
+   queryable metadata (`type=section`, `section`, `plants`, `photo_count`).
+5. **Proactive reminders** are created on demand: when the agent agrees to a
    reminder, `server.py` extracts the agreed time/recurrence from the turn and
    calls `scheduler:CreateSchedule` to create an **EventBridge Scheduler**
    schedule (in a dedicated group) targeting the **Cron Lambda**. When it fires,
@@ -87,8 +93,41 @@ flowchart LR
    recalls the gardener's memory and composes a personalized nudge — or nothing
    when nothing is due — and delivers it to Telegram. One-off reminders
    self-delete after firing; there is no periodic polling sweep.
-5. The **S3 Workspace Store** persists OpenClaw skill data between container
+6. The **S3 Workspace Store** persists OpenClaw skill data between container
    freezes.
+
+## Two ways facts reach memory
+
+Sprout writes to AgentCore Memory through two complementary paths. Knowing which
+one applies explains what the agent can recall — and how precisely.
+
+| | `CreateEvent` (extracted) | `BatchCreateMemoryRecords` (structured) |
+|---|---|---|
+| **What is written** | The conversation transcript | A record the app builds deliberately |
+| **How facts appear** | Extraction strategies derive them asynchronously | Written synchronously, exactly as specified |
+| **Metadata** | Whatever extraction attaches | Explicit: `type`, `section`, `plants`, `photo_count` |
+| **Used for** | Everyday chat (preferences, climate zone, plant talk) | Registering a named backyard section from a photo album |
+
+Every turn is persisted with `CreateEvent`, so the three configured strategies
+(user preference, semantic, summarization) keep deriving long-term records from
+ordinary conversation. On top of that, when you register a bed by captioning a
+photo album, `server.py` writes a **structured** record so "what's in the north
+bed" is a durable, queryable fact rather than something extraction may or may not
+infer from chat text. A focused JSON-only extraction pass pulls the plant names
+out of the agent's own description to populate the `plants` list.
+
+### Querying custom metadata
+
+Custom metadata is stored on the record and returned on retrieval, but
+`RetrieveMemoryRecords`' server-side `metadataFilters` only accepts reserved
+`x-amz-agentcore-memory-*` keys — a custom key such as `section` is rejected with
+`not a valid filter key`. Sprout therefore retrieves semantically (scoped to the
+user's namespace) and filters custom metadata **client-side**:
+
+```python
+# "which beds have basil?" — list-membership match, case-insensitive
+memory.retrieve(chat_id, "beds", metadata_filters={"plants": "basil"})
+```
 
 ## Estimated Monthly Cost
 

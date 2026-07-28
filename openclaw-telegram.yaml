@@ -134,6 +134,10 @@ Resources:
                   - bedrock-agentcore:CreateEvent
                   - bedrock-agentcore:RetrieveMemoryRecords
                   - bedrock-agentcore:ListMemoryRecords
+                  # Writes structured long-term records directly (garden
+                  # sections/plants with queryable metadata), alongside the
+                  # strategy-extracted records derived from CreateEvent.
+                  - bedrock-agentcore:BatchCreateMemoryRecords
                   - bedrock-agentcore:BatchUpdateMemoryRecords
                   - bedrock-agentcore:DeleteMemoryRecord
                 Resource:

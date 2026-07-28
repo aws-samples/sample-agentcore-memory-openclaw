@@ -779,6 +779,259 @@ class Confidence(str, Enum):
     INFERRED = "INFERRED"
 
 
+# =============================================================================
+# Structured long-term records (garden sections) — pure builders + filtering
+# =============================================================================
+# Two complementary write paths into AgentCore Memory:
+#   * CreateEvent (SproutMemory.persist) — the conversational transcript, from
+#     which the configured strategies asynchronously EXTRACT long-term records.
+#   * BatchCreateMemoryRecords (SproutMemory.write_records) — a record the app
+#     writes DELIBERATELY, with queryable metadata attached. Used when the
+#     gardener registers a backyard section (e.g. a photo album of one bed) so
+#     "what's in the north bed" is a durable structured fact rather than
+#     something extraction may or may not derive from chat text.
+#
+# IMPORTANT (verified against the API): custom metadata keys are stored on the
+# record and returned on retrieval, but RetrieveMemoryRecords' server-side
+# ``metadataFilters`` only accepts a small set of reserved
+# ``x-amz-agentcore-memory-*`` keys — a custom key such as ``section`` is
+# rejected with "not a valid filter key". So retrieval stays semantic (+ the
+# per-user namespace) and custom metadata is filtered CLIENT-SIDE via
+# :func:`filter_records_by_metadata`.
+SECTION_RECORD_TYPE = "section"
+# Metadata keys written on a section record (custom, client-side filterable).
+META_TYPE = "type"
+META_SECTION = "section"
+META_PLANTS = "plants"
+META_PHOTO_COUNT = "photo_count"
+# Reserved prefix AgentCore adds to its own metadata keys on stored records.
+RESERVED_METADATA_PREFIX = "x-amz-agentcore-memory-"
+
+
+def derive_section_slug(name: str) -> str:
+    """Normalize a free-text section name into a stable metadata token.
+
+    Lowercases, collapses any run of non-alphanumeric characters to ``_``, and
+    trims leading/trailing separators so "North Bed!" and "north  bed" both
+    yield ``north_bed`` — making the same physical bed match across turns.
+
+    Args:
+        name: The section name as the gardener wrote it (album caption).
+
+    Returns:
+        The slug, or ``""`` when ``name`` has no usable characters.
+    """
+    return _re.sub(r"[^a-z0-9]+", "_", (name or "").strip().lower()).strip("_")
+
+
+def build_metadata_map(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Convert plain Python values into the AgentCore metadata union (pure).
+
+    Maps each value to the matching ``metadataValue`` member: ``str`` ->
+    ``stringValue``, ``bool``/``int``/``float`` -> ``numberValue``, list/tuple of
+    strings -> ``stringListValue``, ``datetime`` -> ``dateTimeValue``. ``None``
+    values and empty lists are omitted so no empty metadata is written.
+
+    Args:
+        values: Plain-value metadata to attach to a record.
+
+    Returns:
+        The metadata map accepted by ``BatchCreateMemoryRecords``.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for key, value in (values or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value:
+                out[key] = {"stringValue": value}
+        elif isinstance(value, bool):
+            out[key] = {"numberValue": float(value)}
+        elif isinstance(value, (int, float)):
+            out[key] = {"numberValue": float(value)}
+        elif isinstance(value, datetime):
+            out[key] = {"dateTimeValue": value}
+        elif isinstance(value, (list, tuple)):
+            items = [str(v) for v in value if v is not None and str(v)]
+            if items:
+                out[key] = {"stringListValue": items}
+    return out
+
+
+def flatten_metadata(metadata: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Flatten a returned AgentCore metadata map into plain Python values (pure).
+
+    Inverse of :func:`build_metadata_map` for reading records back: unwraps each
+    ``{"stringValue"|"numberValue"|"stringListValue"|"dateTimeValue": v}`` union
+    into the bare value. Reserved ``x-amz-agentcore-memory-*`` keys are dropped
+    so callers see only their own metadata. Tolerates already-flat values.
+
+    Args:
+        metadata: The ``metadata`` map from a retrieved record, or ``None``.
+
+    Returns:
+        A flat ``{key: value}`` dict (empty when there is no usable metadata).
+    """
+    flat: dict[str, Any] = {}
+    for key, wrapped in (metadata or {}).items():
+        if key.startswith(RESERVED_METADATA_PREFIX):
+            continue
+        if isinstance(wrapped, dict):
+            for member in ("stringValue", "numberValue", "stringListValue", "dateTimeValue"):
+                if member in wrapped:
+                    flat[key] = wrapped[member]
+                    break
+        else:
+            flat[key] = wrapped
+    return flat
+
+
+# --- Plant-name extraction (for the section record's ``plants`` metadata) -----
+# The vision reply names the plants in prose ("I can see basil, two tomato
+# seedlings and some mint"). To make "which beds have basil?" answerable we need
+# those names as a discrete list, so a focused JSON-only second pass extracts
+# them — the same deterministic-extraction pattern used for schedule directives,
+# rather than trusting the conversational turn to emit structured output.
+PLANT_EXTRACTION_SYSTEM_PROMPT = (
+    "You extract plant names from a gardening assistant's description of a "
+    "garden bed. Output STRICT JSON only — no prose, no markdown, no code "
+    'fences — in exactly this form: {"plants": ["name", ...]}. Rules: '
+    "(1) List only actual plant/crop names that are stated as present in the "
+    "bed. (2) Use the singular, lowercase common name (e.g. 'tomato', not "
+    "'two tomato seedlings'). (3) Do NOT include soil, mulch, pots, tools, "
+    "weeds described as absent, or anything the assistant is unsure about. "
+    '(4) If no plants are identified, output {"plants": []}. '
+    "(5) Output ONLY the JSON object."
+)
+# Cap so a hallucinated/very long list can't bloat the record metadata.
+MAX_SECTION_PLANTS = 25
+
+
+def parse_extracted_plants(raw: str) -> list[str]:
+    """Parse the plant-extraction JSON into a clean, de-duplicated list (pure).
+
+    Tolerant of a model that wraps the JSON in prose or code fences: the
+    outermost ``{...}`` object is located and parsed. Names are lowercased and
+    trimmed, duplicates removed (first occurrence wins, order preserved), and
+    the result capped at :data:`MAX_SECTION_PLANTS`. Never raises — any parse
+    failure yields an empty list so the section record is still written without
+    ``plants``.
+
+    Args:
+        raw: The raw text returned by the extraction model call.
+
+    Returns:
+        The extracted plant names (possibly empty).
+    """
+    text = (raw or "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return []
+    try:
+        data = json.loads(text[start : end + 1])
+    except (ValueError, TypeError):
+        return []
+    raw_plants = data.get("plants") if isinstance(data, dict) else None
+    if not isinstance(raw_plants, list):
+        return []
+    seen: list[str] = []
+    for entry in raw_plants:
+        if not isinstance(entry, str):
+            continue
+        name = entry.strip().lower()
+        if name and name not in seen:
+            seen.append(name)
+        if len(seen) >= MAX_SECTION_PLANTS:
+            break
+    return seen
+
+
+def build_section_record(
+    *,
+    chat_id: str,
+    section_name: str,
+    summary: str,
+    plants: Optional[list[str]] = None,
+    photo_count: int = 0,
+    now: Optional[datetime] = None,
+) -> dict[str, Any]:
+    """Build one ``BatchCreateMemoryRecords`` record for a backyard section (pure).
+
+    Deterministic apart from ``now`` (injectable), so the request body is
+    unit-testable without AWS. The ``requestIdentifier`` is derived from the chat
+    id + section slug so re-registering the same bed targets a stable identifier
+    rather than accumulating unrelated ids.
+
+    Args:
+        chat_id: The Telegram chat id (owner; selects the namespace).
+        section_name: The section name as written by the gardener.
+        summary: The human-readable text stored as the record content.
+        plants: Optional plant names identified in the section.
+        photo_count: How many photos the section was registered from.
+        now: Record timestamp; defaults to the current UTC time.
+
+    Returns:
+        A record dict for the ``records`` list of ``BatchCreateMemoryRecords``.
+    """
+    slug = derive_section_slug(section_name) or "unnamed"
+    timestamp = now or datetime.now(timezone.utc)
+    return {
+        "requestIdentifier": f"section-{_album_token(chat_id)}-{slug}",
+        "namespaces": [derive_long_term_namespace(chat_id)],
+        "content": {"text": summary},
+        "timestamp": timestamp,
+        "metadata": build_metadata_map(
+            {
+                META_TYPE: SECTION_RECORD_TYPE,
+                META_SECTION: slug,
+                META_PLANTS: list(plants or []),
+                META_PHOTO_COUNT: photo_count,
+            }
+        ),
+    }
+
+
+def filter_records_by_metadata(
+    records: list["MemoryContextRecord"], filters: dict[str, Any]
+) -> list["MemoryContextRecord"]:
+    """Filter retrieved records by custom metadata, client-side (pure).
+
+    Server-side ``metadataFilters`` reject custom keys (see the module note
+    above), so equality/membership filtering on our own metadata happens here.
+    A record matches when, for every ``(key, expected)`` pair, its metadata has
+    that key and either equals ``expected`` or — when the stored value is a list
+    — contains it. String comparison is case-insensitive.
+
+    Args:
+        records: Normalized records from retrieval.
+        filters: Required ``{key: expected}`` metadata pairs; empty means no-op.
+
+    Returns:
+        Only the records matching every filter (input order preserved).
+    """
+    if not filters:
+        return list(records)
+
+    def _eq(actual: Any, expected: Any) -> bool:
+        if isinstance(actual, str) and isinstance(expected, str):
+            return actual.strip().lower() == expected.strip().lower()
+        return actual == expected
+
+    def _matches(record: "MemoryContextRecord") -> bool:
+        for key, expected in filters.items():
+            if key not in record.metadata:
+                return False
+            actual = record.metadata[key]
+            if isinstance(actual, (list, tuple)):
+                if not any(_eq(item, expected) for item in actual):
+                    return False
+            elif not _eq(actual, expected):
+                return False
+        return True
+
+    return [r for r in records if _matches(r)]
+
+
 @dataclass
 class MemoryContextRecord:
     """A normalized, retrieved memory ready for context assembly.
@@ -799,6 +1052,11 @@ class MemoryContextRecord:
     confidence_class: Confidence
     topic: str = ""
     record_id: str = ""
+    # Flattened custom metadata from the stored record (reserved
+    # ``x-amz-agentcore-memory-*`` keys removed). Enables client-side filtering
+    # (:func:`filter_records_by_metadata`) since the API rejects custom keys in
+    # server-side metadataFilters.
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def assemble_memory_context(
@@ -988,6 +1246,7 @@ def normalize_record(raw: dict[str, Any]) -> MemoryContextRecord:
         confidence_class=classify_raw_record(raw),
         topic=str(topic),
         record_id=str(record_id),
+        metadata=flatten_metadata(metadata),
     )
 
 
@@ -1071,7 +1330,13 @@ class SproutMemory:
             self._client = boto3.client("bedrock-agentcore")
         return self._client
 
-    def retrieve(self, chat_id: str, query: str) -> list[MemoryContextRecord]:
+    def retrieve(
+        self,
+        chat_id: str,
+        query: str,
+        *,
+        metadata_filters: Optional[dict[str, Any]] = None,
+    ) -> list[MemoryContextRecord]:
         """Retrieve up to 50 relevant long-term memories (Req 5.1, 5.5).
 
         Calls ``RetrieveMemoryRecords`` against ``sprout/{chat_id}/long_term``
@@ -1083,6 +1348,10 @@ class SproutMemory:
         Args:
             chat_id: The Telegram chat id (the authenticated actor).
             query: The user's current message, used as the semantic search query.
+            metadata_filters: Optional ``{key: expected}`` custom-metadata pairs
+                (e.g. ``{"section": "north_bed"}``). Applied CLIENT-SIDE by
+                :func:`filter_records_by_metadata` because the API rejects custom
+                keys in server-side ``metadataFilters``.
 
         Returns:
             The normalized, retrieved records (unassembled), or ``[]`` on
@@ -1127,7 +1396,8 @@ class SproutMemory:
         finally:
             executor.shutdown(wait=False)
 
-        return [normalize_record(raw) for raw in raw_records if isinstance(raw, dict)]
+        normalized = [normalize_record(raw) for raw in raw_records if isinstance(raw, dict)]
+        return filter_records_by_metadata(normalized, metadata_filters or {})
 
     def persist(self, chat_id: str, session_id: str, messages: list[dict[str, str]]) -> bool:
         """Persist the session transcript via ``CreateEvent`` (Req 4.4, 4.6).
@@ -1171,6 +1441,46 @@ class SproutMemory:
                 exc_info=True,
             )
             return False
+
+    def write_records(self, records: list[dict[str, Any]]) -> int:
+        """Write structured long-term records via ``BatchCreateMemoryRecords``.
+
+        Complements :meth:`persist`: instead of relying on asynchronous
+        extraction to derive facts from chat text, this stores records the app
+        built deliberately (e.g. a registered backyard section) together with
+        queryable metadata. Failures are logged and swallowed — a missing
+        structured record must never break the user's turn, since the
+        conversational transcript is still persisted.
+
+        Args:
+            records: Record dicts from :func:`build_section_record`.
+
+        Returns:
+            The number of records AgentCore reported as successfully created
+            (``0`` when the call failed or ``records`` is empty).
+        """
+        if not records:
+            return 0
+        try:
+            response = self._agentcore_client().batch_create_memory_records(
+                memoryId=self._memory_id,
+                records=records,
+            )
+        except Exception:  # noqa: BLE001 — non-fatal, mirrors persist().
+            logger.error(
+                "BatchCreateMemoryRecords failed; structured record not written",
+                exc_info=True,
+            )
+            return 0
+        successful = response.get("successfulRecords") or []
+        failed = response.get("failedRecords") or []
+        if failed:
+            logger.warning(
+                "BatchCreateMemoryRecords partially failed: %d ok, %d failed",
+                len(successful),
+                len(failed),
+            )
+        return len(successful)
 
 
 def _normalize_role(role: Any) -> str:
@@ -1791,6 +2101,40 @@ class OpenClawAgent:
             raise RuntimeError(f"Bedrock cron nudge composition failed: {exc}") from exc
         return ("\n".join(text_parts)).strip()
 
+    def extract_plant_names(self, *, description: str) -> list[str]:
+        """Extract the plant names named in a bed description (second pass).
+
+        Calls Bedrock Converse directly with a JSON-only extraction prompt over
+        the assistant's own description of the bed, then parses the result via
+        :func:`parse_extracted_plants`. Uses the cheap text model with a
+        zero-temperature, small completion. Never raises — any failure yields
+        ``[]`` so the section record is still written, just without ``plants``.
+
+        Args:
+            description: The assistant's reply describing the section's photos.
+
+        Returns:
+            The extracted plant names (possibly empty).
+        """
+        if not (description or "").strip():
+            return []
+        import boto3
+
+        try:
+            client = boto3.client("bedrock-runtime")
+            response = client.converse(
+                modelId=self._model_id,
+                system=[{"text": PLANT_EXTRACTION_SYSTEM_PROMPT}],
+                messages=[{"role": "user", "content": [{"text": description}]}],
+                inferenceConfig={"maxTokens": 256, "temperature": 0.0},
+            )
+            output = response["output"]["message"]["content"]
+            raw = "\n".join(block["text"] for block in output if "text" in block)
+        except Exception:  # noqa: BLE001 — degrade to no extracted plants.
+            logger.exception("Plant extraction pass failed; section saved without plants")
+            return []
+        return parse_extracted_plants(raw)
+
     def extract_schedule_directives(
         self, *, user_message: str, assistant_reply: str, now_iso: str
     ) -> list[dict[str, str]]:
@@ -2026,6 +2370,7 @@ class SproutRuntime:
         #     process the whole album once. Non-winners return an empty reply so
         #     Telegram receives nothing from them. The winner continues below
         #     with the merged caption + all album images.
+        album_section_caption = ""
         media_group_id = payload.get(MEDIA_GROUP_ID_KEY)
         if media_group_id and not is_cron and self._album_buffer is not None:
             assembled_album = self._assemble_album(chat_id, str(media_group_id), payload)
@@ -2045,7 +2390,7 @@ class SproutRuntime:
                         "transcript_persisted": False,
                     },
                 }
-            message, images = assembled_album
+            message, images, album_section_caption = assembled_album
 
         # 2. Workspace download (graceful degradation, Req 9.2, 9.4). chat_id is
         #    allowlist-validated above; resolve_within is a second barrier that
@@ -2156,6 +2501,32 @@ class SproutRuntime:
             ],
         )
 
+        # 7b. Register a named backyard section as a STRUCTURED record when the
+        #     gardener captioned a photo album (e.g. "North bed"). This is
+        #     written deliberately with queryable metadata rather than left to
+        #     asynchronous extraction, so "what's in the north bed" is a durable
+        #     fact. Non-fatal: a failure never affects the reply.
+        sections_written = 0
+        if album_section_caption:
+            # Pull the plant names out of the assistant's own description so the
+            # section record carries them as discrete, filterable metadata
+            # ("which beds have basil?") rather than only as prose.
+            plants = self._extract_section_plants(response_text)
+            sections_written = self._memory.write_records(
+                [
+                    build_section_record(
+                        chat_id=chat_id,
+                        section_name=album_section_caption,
+                        summary=(
+                            f"Backyard section '{album_section_caption}' "
+                            f"(registered from {len(images)} photo(s)): {response_text}"
+                        ),
+                        plants=plants,
+                        photo_count=len(images),
+                    )
+                ]
+            )
+
         # 8. Workspace upload (graceful degradation, Req 9.3, 9.5).
         self._workspace.upload(chat_id, workspace_dir)
 
@@ -2167,6 +2538,7 @@ class SproutRuntime:
                 "memory_records_retrieved": len(assembled),
                 "session_id": session_id,
                 "transcript_persisted": persisted,
+                "sections_written": sections_written,
                 "schedules_created": schedules_created,
             },
         }
@@ -2209,6 +2581,29 @@ class SproutRuntime:
         if not cleaned and created:
             cleaned = "Done \u2014 I'll send you a reminder. \U0001f331"
         return cleaned, created
+
+    def _extract_section_plants(self, description: str) -> list[str]:
+        """Extract plant names for a section record, degrading to ``[]``.
+
+        Delegates to :meth:`OpenClawAgent.extract_plant_names`. Tolerates an
+        injected agent without that method (returning ``[]``) so the section is
+        still registered — the plant list is an enrichment, never a requirement.
+
+        Args:
+            description: The assistant's description of the section's photos.
+
+        Returns:
+            The extracted plant names, or ``[]``.
+        """
+        extractor = getattr(self._agent, "extract_plant_names", None)
+        if not callable(extractor):
+            return []
+        try:
+            plants = extractor(description=description)
+        except Exception:  # noqa: BLE001 — enrichment only, never fatal.
+            logger.warning("Plant extraction failed; section saved without plants")
+            return []
+        return plants if isinstance(plants, list) else []
 
     def _extract_and_create_schedules(
         self, *, chat_id: str, user_message: str, assistant_reply: str
@@ -2270,8 +2665,10 @@ class SproutRuntime:
                 ``images``, ``message_id``).
 
         Returns:
-            ``(message, images)`` for the album's single processor, or ``None``
-            for a buffered (non-winning) item.
+            ``(message, images, section_caption)`` for the album's single
+            processor — where ``section_caption`` is the gardener's caption for
+            the group (``""`` when none) so the caller can register it as a
+            backyard section — or ``None`` for a buffered (non-winning) item.
         """
         buffer = self._album_buffer
         message_id = str(payload.get(MESSAGE_ID_KEY) or uuid.uuid4().hex)
@@ -2285,7 +2682,7 @@ class SproutRuntime:
         except Exception:  # noqa: BLE001 — if buffering fails, fall back to
             # handling this single item normally rather than dropping it.
             logger.warning("Album buffering failed; handling item individually", exc_info=True)
-            return str(payload.get("message", "")), item["images"]
+            return str(payload.get("message", "")), item["images"], ""
 
         buffer.wait_debounce()
         if not buffer.try_claim(chat_id, media_group_id):
@@ -2311,7 +2708,7 @@ class SproutRuntime:
             len(all_images),
             len(captions),
         )
-        return merged_message, all_images
+        return merged_message, all_images, section_caption
 
 
 def _error_envelope(error: str, message: str) -> dict[str, Any]:
