@@ -405,3 +405,117 @@ def test_normal_turn_writes_no_section_record():
 
     assert result["metadata"]["sections_written"] == 0
     assert memory.written == []
+
+
+# =============================================================================
+# Plant-name extraction -> section record ``plants`` metadata
+# =============================================================================
+from server import parse_extracted_plants  # noqa: E402
+
+
+def test_parse_extracted_plants_basic():
+    assert parse_extracted_plants('{"plants": ["basil", "tomato"]}') == ["basil", "tomato"]
+
+
+def test_parse_extracted_plants_tolerates_fences_and_prose():
+    raw = 'Sure:\n```json\n{"plants": ["Basil", "Mint"]}\n```\nDone.'
+    assert parse_extracted_plants(raw) == ["basil", "mint"]
+
+
+def test_parse_extracted_plants_normalizes_and_dedupes():
+    raw = '{"plants": ["Basil", " basil ", "TOMATO", "", 5, null]}'
+    assert parse_extracted_plants(raw) == ["basil", "tomato"]
+
+
+def test_parse_extracted_plants_empty_and_invalid():
+    assert parse_extracted_plants('{"plants": []}') == []
+    assert parse_extracted_plants("not json") == []
+    assert parse_extracted_plants("") == []
+    assert parse_extracted_plants('{"plants": "basil"}') == []
+
+
+def test_parse_extracted_plants_caps_length():
+    many = ", ".join(f'"p{i}"' for i in range(60))
+    assert len(parse_extracted_plants('{"plants": [%s]}' % many)) == server.MAX_SECTION_PLANTS
+
+
+class _PlantAgent(_StubAgent):
+    def __init__(self, plants):
+        self._plants = plants
+        self.calls = []
+
+    def extract_plant_names(self, *, description):
+        self.calls.append(description)
+        return list(self._plants)
+
+
+def _runtime_with_agent(agent, memory):
+    return server.SproutRuntime(
+        memory=memory,
+        workspace=_StubWorkspace(),
+        agent=agent,
+        base_persona="You are Sprout.",
+        model_id="model",
+        album_buffer=server.AlbumBuffer("bucket", client=_FakeS3(), debounce_seconds=0),
+    )
+
+
+def _album_payload(group):
+    return {
+        "user_id": "12345",
+        "message": "North bed",
+        "images": [{"data": "aaa", "media_type": "image/png"}],
+        "invocation_type": "webhook",
+        "media_group_id": group,
+        "message_id": "1",
+    }
+
+
+def test_section_record_includes_extracted_plants():
+    memory = _RecordingMemory()
+    agent = _PlantAgent(["basil", "tomato"])
+    runtime = _runtime_with_agent(agent, memory)
+
+    result = runtime.handle_invocation(_album_payload("gp1"))
+
+    assert result["metadata"]["sections_written"] == 1
+    assert memory.written[0]["metadata"]["plants"] == {
+        "stringListValue": ["basil", "tomato"]
+    }
+    # The extractor saw the assistant's description of the bed.
+    assert "basil" in agent.calls[0] or agent.calls[0]
+
+
+def test_section_record_omits_plants_when_none_extracted():
+    memory = _RecordingMemory()
+    runtime = _runtime_with_agent(_PlantAgent([]), memory)
+
+    runtime.handle_invocation(_album_payload("gp2"))
+
+    # build_metadata_map omits empty lists, so no plants key is written.
+    assert "plants" not in memory.written[0]["metadata"]
+
+
+def test_section_still_written_when_plant_extraction_raises():
+    class _BoomAgent(_StubAgent):
+        def extract_plant_names(self, *, description):
+            raise RuntimeError("bedrock down")
+
+    memory = _RecordingMemory()
+    runtime = _runtime_with_agent(_BoomAgent(), memory)
+
+    result = runtime.handle_invocation(_album_payload("gp3"))
+
+    # Enrichment failure must not lose the section registration.
+    assert result["metadata"]["sections_written"] == 1
+    assert "plants" not in memory.written[0]["metadata"]
+
+
+def test_plants_metadata_is_filterable_client_side():
+    # End-to-end intent: "which beds have basil?" works via list membership.
+    records = [
+        _rec("north", section="north_bed", plants=["basil", "tomato"]),
+        _rec("south", section="south_bed", plants=["rose"]),
+    ]
+    out = filter_records_by_metadata(records, {"plants": "Basil"})
+    assert [r.content for r in out] == ["north"]

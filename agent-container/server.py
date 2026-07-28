@@ -886,6 +886,66 @@ def flatten_metadata(metadata: Optional[dict[str, Any]]) -> dict[str, Any]:
     return flat
 
 
+# --- Plant-name extraction (for the section record's ``plants`` metadata) -----
+# The vision reply names the plants in prose ("I can see basil, two tomato
+# seedlings and some mint"). To make "which beds have basil?" answerable we need
+# those names as a discrete list, so a focused JSON-only second pass extracts
+# them — the same deterministic-extraction pattern used for schedule directives,
+# rather than trusting the conversational turn to emit structured output.
+PLANT_EXTRACTION_SYSTEM_PROMPT = (
+    "You extract plant names from a gardening assistant's description of a "
+    "garden bed. Output STRICT JSON only — no prose, no markdown, no code "
+    'fences — in exactly this form: {"plants": ["name", ...]}. Rules: '
+    "(1) List only actual plant/crop names that are stated as present in the "
+    "bed. (2) Use the singular, lowercase common name (e.g. 'tomato', not "
+    "'two tomato seedlings'). (3) Do NOT include soil, mulch, pots, tools, "
+    "weeds described as absent, or anything the assistant is unsure about. "
+    '(4) If no plants are identified, output {"plants": []}. '
+    "(5) Output ONLY the JSON object."
+)
+# Cap so a hallucinated/very long list can't bloat the record metadata.
+MAX_SECTION_PLANTS = 25
+
+
+def parse_extracted_plants(raw: str) -> list[str]:
+    """Parse the plant-extraction JSON into a clean, de-duplicated list (pure).
+
+    Tolerant of a model that wraps the JSON in prose or code fences: the
+    outermost ``{...}`` object is located and parsed. Names are lowercased and
+    trimmed, duplicates removed (first occurrence wins, order preserved), and
+    the result capped at :data:`MAX_SECTION_PLANTS`. Never raises — any parse
+    failure yields an empty list so the section record is still written without
+    ``plants``.
+
+    Args:
+        raw: The raw text returned by the extraction model call.
+
+    Returns:
+        The extracted plant names (possibly empty).
+    """
+    text = (raw or "").strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return []
+    try:
+        data = json.loads(text[start : end + 1])
+    except (ValueError, TypeError):
+        return []
+    raw_plants = data.get("plants") if isinstance(data, dict) else None
+    if not isinstance(raw_plants, list):
+        return []
+    seen: list[str] = []
+    for entry in raw_plants:
+        if not isinstance(entry, str):
+            continue
+        name = entry.strip().lower()
+        if name and name not in seen:
+            seen.append(name)
+        if len(seen) >= MAX_SECTION_PLANTS:
+            break
+    return seen
+
+
 def build_section_record(
     *,
     chat_id: str,
@@ -2041,6 +2101,40 @@ class OpenClawAgent:
             raise RuntimeError(f"Bedrock cron nudge composition failed: {exc}") from exc
         return ("\n".join(text_parts)).strip()
 
+    def extract_plant_names(self, *, description: str) -> list[str]:
+        """Extract the plant names named in a bed description (second pass).
+
+        Calls Bedrock Converse directly with a JSON-only extraction prompt over
+        the assistant's own description of the bed, then parses the result via
+        :func:`parse_extracted_plants`. Uses the cheap text model with a
+        zero-temperature, small completion. Never raises — any failure yields
+        ``[]`` so the section record is still written, just without ``plants``.
+
+        Args:
+            description: The assistant's reply describing the section's photos.
+
+        Returns:
+            The extracted plant names (possibly empty).
+        """
+        if not (description or "").strip():
+            return []
+        import boto3
+
+        try:
+            client = boto3.client("bedrock-runtime")
+            response = client.converse(
+                modelId=self._model_id,
+                system=[{"text": PLANT_EXTRACTION_SYSTEM_PROMPT}],
+                messages=[{"role": "user", "content": [{"text": description}]}],
+                inferenceConfig={"maxTokens": 256, "temperature": 0.0},
+            )
+            output = response["output"]["message"]["content"]
+            raw = "\n".join(block["text"] for block in output if "text" in block)
+        except Exception:  # noqa: BLE001 — degrade to no extracted plants.
+            logger.exception("Plant extraction pass failed; section saved without plants")
+            return []
+        return parse_extracted_plants(raw)
+
     def extract_schedule_directives(
         self, *, user_message: str, assistant_reply: str, now_iso: str
     ) -> list[dict[str, str]]:
@@ -2414,6 +2508,10 @@ class SproutRuntime:
         #     fact. Non-fatal: a failure never affects the reply.
         sections_written = 0
         if album_section_caption:
+            # Pull the plant names out of the assistant's own description so the
+            # section record carries them as discrete, filterable metadata
+            # ("which beds have basil?") rather than only as prose.
+            plants = self._extract_section_plants(response_text)
             sections_written = self._memory.write_records(
                 [
                     build_section_record(
@@ -2423,6 +2521,7 @@ class SproutRuntime:
                             f"Backyard section '{album_section_caption}' "
                             f"(registered from {len(images)} photo(s)): {response_text}"
                         ),
+                        plants=plants,
                         photo_count=len(images),
                     )
                 ]
@@ -2482,6 +2581,29 @@ class SproutRuntime:
         if not cleaned and created:
             cleaned = "Done \u2014 I'll send you a reminder. \U0001f331"
         return cleaned, created
+
+    def _extract_section_plants(self, description: str) -> list[str]:
+        """Extract plant names for a section record, degrading to ``[]``.
+
+        Delegates to :meth:`OpenClawAgent.extract_plant_names`. Tolerates an
+        injected agent without that method (returning ``[]``) so the section is
+        still registered — the plant list is an enrichment, never a requirement.
+
+        Args:
+            description: The assistant's description of the section's photos.
+
+        Returns:
+            The extracted plant names, or ``[]``.
+        """
+        extractor = getattr(self._agent, "extract_plant_names", None)
+        if not callable(extractor):
+            return []
+        try:
+            plants = extractor(description=description)
+        except Exception:  # noqa: BLE001 — enrichment only, never fatal.
+            logger.warning("Plant extraction failed; section saved without plants")
+            return []
+        return plants if isinstance(plants, list) else []
 
     def _extract_and_create_schedules(
         self, *, chat_id: str, user_message: str, assistant_reply: str
