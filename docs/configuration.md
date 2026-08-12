@@ -47,7 +47,7 @@ Set by the `EnvironmentVariables` block of the `AgentCoreRuntime` resource in
 | --- | --- | --- |
 | `MODEL_ID` | `ModelId` parameter | Bedrock model / cross-region inference profile the agent and prompt-cached Converse calls use for text. Read by `server.py` at invocation time. |
 | `VISION_MODEL_ID` | `VisionModelId` parameter | Bedrock model used for plant image identification (vision). Read by `server.py` when an invocation includes images. |
-| `MEMORY_ID` | `AgentCoreMemory.MemoryId` | AgentCore Memory resource ID targeted by all `RetrieveMemoryRecords` and `CreateEvent` data-plane calls. |
+| `MEMORY_ID` | `AgentCoreMemory.MemoryId` | AgentCore Memory resource ID targeted by all data-plane calls — `RetrieveMemoryRecords`, `CreateEvent`, and `BatchCreateMemoryRecords`. |
 | `WORKSPACE_BUCKET` | `WorkspaceBucket` | S3 bucket used to persist the OpenClaw workspace between container freezes. When unset, workspace persistence becomes a no-op. |
 
 Additional runtime tuning variables read by `server.py` (not set by the template today —
@@ -70,6 +70,73 @@ resources:
 | `AGENTCORE_RUNTIME_ARN` | `AgentCoreRuntime.AgentRuntimeArn` | ARN the Lambda invokes via `InvokeAgentRuntime` to run the agent. |
 | `BOT_TOKEN_SECRET_ARN` | `BotTokenSecret` | Secrets Manager ARN the Lambda reads (uncached, always latest) to obtain the Telegram bot token. |
 | `TELEGRAM_API_BASE` | Literal `https://api.telegram.org` | Base URL for Telegram Bot API calls (`sendMessage`, `getFile`, etc.). |
+
+## Memory configuration
+
+The `AgentCoreMemory` resource in the template is configured in three parts —
+namespaces, indexed keys, and the per-strategy metadata schema — all of which affect
+what the agent can recall and how precisely.
+
+### Namespaces
+
+Both extraction strategies write to the same per-user namespace:
+
+| Strategy | Namespace |
+| --- | --- |
+| `UserPreferenceMemoryStrategy` | `sprout/{actorId}/long_term` |
+| `SemanticMemoryStrategy` | `sprout/{actorId}/long_term` |
+
+The runtime retrieves with the **`namespacePath`** parameter rather than
+`namespace`. Today the two are equivalent, since both strategies write directly to
+that namespace — but `namespace` matches only the *exact* value given, so anything
+stored deeper in the subtree would be silently omitted. Using the path form keeps
+retrieval correct if a nested strategy is added later.
+
+> There is deliberately **no** `SummaryMemoryStrategy`. Session summaries restated,
+> in looser prose, facts the semantic and user-preference strategies already
+> extract, while costing extraction on every session and accumulating one record per
+> session that competes for the capped retrieval budget. If you add one back, its
+> namespace **must** end in `{sessionId}` — the service rejects a summarization
+> namespace without it — which is exactly the nested case `namespacePath` handles.
+
+### Indexed keys
+
+`IndexedKeys` declares which metadata keys may be used in a server-side
+`metadataFilters` expression. Sprout indexes:
+
+| Key | Type | Used for |
+| --- | --- | --- |
+| `type` | `STRING` | Separating sections, plants, conditions, and care |
+| `section` | `STRING` | Scoping retrieval to one backyard area |
+| `plants` | `STRINGLIST` | `CONTAINS` lookups such as "which beds have basil?" |
+
+Filters on indexed keys are applied **before** the vector search, so they narrow the
+candidate set rather than trimming whatever similarity returned. Filtering on a
+non-indexed key raises `ValidationException`; such metadata (for example
+`photo_count`) is still stored on the record and returned by
+`Get`/`ListMemoryRecords`, and `server.py` filters it in-process instead.
+
+> Indexed keys are **additive-only and cannot be removed** once added, with a limit
+> of 10 per memory resource. Add them deliberately, and reserve them for dimensions
+> you actually filter on.
+
+### Metadata schema (extraction instructions)
+
+Each strategy declares a `MemoryRecordSchema.MetadataSchema`, which is how the
+extraction model is instructed:
+
+- `Definition` — what the field means (this is the primary instruction).
+- `LlmExtractionInstruction` — extra guidance and conflict resolution; the built-in
+  `LATEST_VALUE` keeps the most recent value when events disagree.
+- `Validation.AllowedValues` / `MaxItems` — constrains the output so filter values
+  stay consistent (without it the model may emit `Herbs`, `herbs`, and `HERB` for
+  one concept and break downstream matching).
+
+Keys whose values the application already knows are also attached to the event via
+`CreateEvent` metadata (see `build_event_metadata` in `server.py`), so extraction
+propagates them onto derived records instead of re-inferring them from prose. Note
+that `CreateEvent` metadata is `stringValue`-only, so list-valued dimensions such as
+`plants` are supplied on records written directly with `BatchCreateMemoryRecords`.
 
 ## Model switching
 

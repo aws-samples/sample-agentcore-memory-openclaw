@@ -62,7 +62,7 @@ class FakeMemory:
         self.retrieve_args = (chat_id, query)
         return list(self._records)
 
-    def persist(self, chat_id, session_id, messages):
+    def persist(self, chat_id, session_id, messages, metadata=None):
         self.calls.append("persist")
         self.persist_args = (chat_id, session_id, messages)
         return self._persist_result
@@ -478,8 +478,11 @@ def test_sprout_memory_retrieve_success_normalizes_records():
     assert len(records) == 1
     assert records[0].content == "Grows tomatoes"
     assert records[0].confidence_class is Confidence.EXPLICIT
-    # Retrieval is scoped to the user's long-term namespace and the query.
-    assert client.kwargs["namespace"] == "sprout/chat-1/long_term"
+    # Retrieval is scoped to the user's long-term subtree via namespacePath (not
+    # the exact `namespace`, which would omit session summaries stored one level
+    # deeper at sprout/{chat_id}/long_term/{sessionId}).
+    assert client.kwargs["namespacePath"] == "sprout/chat-1/long_term"
+    assert "namespace" not in client.kwargs
     assert client.kwargs["searchCriteria"] == {"searchQuery": "tomato care"}
     assert client.kwargs["maxResults"] == server.MAX_MEMORIES_IN_CONTEXT
 

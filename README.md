@@ -52,7 +52,7 @@ flowchart LR
     EB[EventBridge<br/>Scheduler]
     CRON[Cron Lambda]
     RT[AgentCore Runtime<br/>OpenClaw container linux/arm64<br/>server.py memory hooks]
-    MEM[(AgentCore Memory<br/>sprout/&#123;chat_id&#125;/long_term<br/>sprout/&#123;chat_id&#125;/episodic)]
+    MEM[(AgentCore Memory<br/>sprout/&#123;chat_id&#125;/long_term<br/>user-preference + semantic)]
     S3[(S3 Workspace Store)]
     BR[Bedrock Model<br/>Claude Haiku 4.5]
 
@@ -103,29 +103,62 @@ one applies explains what the agent can recall — and how precisely.
 |---|---|---|
 | **What is written** | The conversation transcript | A record the app builds deliberately |
 | **How facts appear** | Extraction strategies derive them asynchronously | Written synchronously, exactly as specified |
-| **Metadata** | Whatever extraction attaches | Explicit: `type`, `section`, `plants`, `photo_count` |
+| **Metadata** | Declared per strategy; extraction fills it in | Supplied explicitly by the app |
 | **Used for** | Everyday chat (preferences, climate zone, plant talk) | Registering a named backyard section from a photo album |
 
-Every turn is persisted with `CreateEvent`, so the three configured strategies
-(user preference, semantic, summarization) keep deriving long-term records from
+Every turn is persisted with `CreateEvent`, so the two configured strategies
+(user preference and semantic) keep deriving long-term records from
 ordinary conversation. On top of that, when you register a bed by captioning a
 photo album, `server.py` writes a **structured** record so "what's in the north
 bed" is a durable, queryable fact rather than something extraction may or may not
 infer from chat text. A focused JSON-only extraction pass pulls the plant names
 out of the agent's own description to populate the `plants` list.
 
+Both paths converge on the same metadata shape. Each strategy declares a
+`MemoryRecordSchema.MetadataSchema` in the template, where `Definition` and
+`LlmExtractionInstruction` are the instructions handed to the extraction model
+and `Validation.AllowedValues` constrains the output — so extracted records carry
+the same `type` / `section` / `plants` dimensions the app writes directly, with
+consistent values.
+
 ### Querying custom metadata
 
-Custom metadata is stored on the record and returned on retrieval, but
-`RetrieveMemoryRecords`' server-side `metadataFilters` only accepts reserved
-`x-amz-agentcore-memory-*` keys — a custom key such as `section` is rejected with
-`not a valid filter key`. Sprout therefore retrieves semantically (scoped to the
-user's namespace) and filters custom metadata **client-side**:
+Custom metadata keys are filterable **server-side**, but only when declared as
+`IndexedKeys` on the memory resource. AgentCore applies indexed-key filters
+*before* the vector search, so a filter narrows the candidate set rather than
+trimming whatever similarity happened to return:
 
 ```python
-# "which beds have basil?" — list-membership match, case-insensitive
+# "which beds have basil?" — CONTAINS on the plants STRINGLIST, pushed down
 memory.retrieve(chat_id, "beds", metadata_filters={"plants": "basil"})
 ```
+
+Sprout indexes `type`, `section`, and `plants`. Filtering on a key that is *not*
+indexed raises `ValidationException` ("not a valid filter key"), so non-indexed
+metadata such as `photo_count` is still stored and returned on the record but is
+filtered in-process instead.
+
+> Indexed keys are **additive-only and cannot be removed** once added (max 10 per
+> memory resource), so add them deliberately. Reserve them for dimensions you
+> actually filter on and leave enrichment-only fields non-indexed.
+
+Temporal scoping is also available without spending an indexed-key slot: the
+service-generated `x-amz-agentcore-memory-createdAt` field is filterable with
+`BEFORE`/`AFTER`, exposed as `retrieve(..., created_after=...)`. Sprout does not
+apply it on the normal chat or reminder paths on purpose — the facts those paths
+need ("grows basil in containers", "zone 9b") are the *oldest* ones, and a recency
+bound would hide them. It is there for genuinely recency-scoped questions.
+
+### A note on redundancy
+
+Registering one album writes the deterministic section record **and** leaves the
+same turn to the semantic and user-preference strategies, so several records can
+describe the same bed. That is a deliberate trade: the direct write is synchronous
+and guaranteed (extraction is asynchronous and best-effort), which is what makes a
+just-registered bed immediately recallable. The cost is that those records share
+the capped retrieval budget, so the direct record's content is kept to the durable
+facts rather than embedding the agent's full reply. If you index many dimensions or
+register many sections, watch how much of the budget goes to duplicates.
 
 ## Estimated Monthly Cost
 

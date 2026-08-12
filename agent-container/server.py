@@ -39,7 +39,7 @@ Invocation lifecycle (within each ``POST /invocations``)
 Testability
 -----------
 The deterministic logic — namespace derivation (:func:`derive_long_term_namespace`,
-:func:`derive_episodic_namespace`) and memory-context assembly
+:func:`derive_long_term_namespace_path`) and memory-context assembly
 (:func:`assemble_memory_context`) — is implemented as pure, module-level
 functions with no I/O so they can be unit/property tested in isolation
 (tasks 2.3, 2.4). All heavy/optional dependencies (``boto3``, ``requests``) are
@@ -87,9 +87,13 @@ INVOCATIONS_PATH = "/invocations"
 DEFAULT_PORT = 8080
 
 # --- Memory namespace convention (Req 6.1) ------------------------------------
+# Both extraction strategies (user-preference and semantic) write to
+# ``sprout/{chat_id}/long_term``. Retrieval uses ``namespacePath`` rather than
+# ``namespace`` because ``namespace`` matches only the EXACT value given: a strategy
+# nested one level deeper (a summarization strategy must end in ``{sessionId}``)
+# would be silently omitted. ``namespacePath`` returns the whole subtree.
 NAMESPACE_ROOT = "sprout"
 LONG_TERM_SEGMENT = "long_term"
-EPISODIC_SEGMENT = "episodic"
 
 # --- Memory retrieval / assembly bounds ---------------------------------------
 MAX_MEMORIES_IN_CONTEXT = 50  # Req 5.4
@@ -199,29 +203,43 @@ def derive_long_term_namespace(chat_id: str) -> str:
     Args:
         chat_id: The Telegram chat id used as the AgentCore ``actorId``.
 
+    Note:
+        This is the exact namespace both extraction strategies write to. It does
+        NOT reach deeper namespaces: verified against the service, querying
+        ``namespace="sprout/{id}/long_term"`` returns only records stored at
+        exactly that namespace, not ones nested beneath it. Retrieval therefore
+        uses :func:`derive_long_term_namespace_path` with the ``namespacePath``
+        parameter, which covers the whole subtree.
+
     Returns:
         The namespace ``sprout/{chat_id}/long_term``.
     """
     return f"{NAMESPACE_ROOT}/{chat_id}/{LONG_TERM_SEGMENT}"
 
 
-def derive_episodic_namespace(chat_id: str, session_id: str) -> str:
-    """Derive the episodic memory namespace for a chat id + session (Req 6.1).
+def derive_long_term_namespace_path(chat_id: str) -> str:
+    """Derive the hierarchical namespace path covering all of a user's memories.
+
+    Passed as ``namespacePath`` (not ``namespace``) to ``RetrieveMemoryRecords`` /
+    ``ListMemoryRecords`` to retrieve every record in the subtree. Today both
+    extraction strategies write directly to ``sprout/{chat_id}/long_term``, so this
+    is equivalent — but ``namespace`` matches only the exact value given (verified
+    against the service), so anything nested deeper would be silently omitted.
+    Using the path keeps retrieval correct if a nested strategy is ever added.
 
     Args:
         chat_id: The Telegram chat id used as the AgentCore ``actorId``.
-        session_id: The per-invocation session identifier.
 
     Returns:
-        The namespace ``sprout/{chat_id}/episodic/{session_id}``.
+        The namespace path ``sprout/{chat_id}/long_term``.
     """
-    return f"{NAMESPACE_ROOT}/{chat_id}/{EPISODIC_SEGMENT}/{session_id}"
+    return derive_long_term_namespace(chat_id)
 
 
 def chat_id_from_namespace(namespace: str) -> str:
     """Extract the owning chat id from a Sprout namespace.
 
-    Inverse of :func:`derive_long_term_namespace` / :func:`derive_episodic_namespace`
+    Inverse of :func:`derive_long_term_namespace`
     used to enforce namespace isolation (Req 6.4).
 
     Args:
@@ -791,21 +809,31 @@ class Confidence(str, Enum):
 #     "what's in the north bed" is a durable structured fact rather than
 #     something extraction may or may not derive from chat text.
 #
-# IMPORTANT (verified against the API): custom metadata keys are stored on the
-# record and returned on retrieval, but RetrieveMemoryRecords' server-side
-# ``metadataFilters`` only accepts a small set of reserved
-# ``x-amz-agentcore-memory-*`` keys — a custom key such as ``section`` is
-# rejected with "not a valid filter key". So retrieval stays semantic (+ the
-# per-user namespace) and custom metadata is filtered CLIENT-SIDE via
-# :func:`filter_records_by_metadata`.
+# Custom metadata keys ARE filterable server-side, but only when declared as
+# ``IndexedKeys`` on the memory resource (see ``AgentCoreMemory`` in
+# openclaw-telegram.yaml). AgentCore pre-filters on indexed keys BEFORE the
+# vector search, so a filter shrinks the candidate set instead of trimming
+# whatever similarity happened to return — a section can otherwise be missed
+# entirely because it did not rank in the top-K. Filtering on a key that is NOT
+# indexed raises ValidationException ("not a valid filter key"); such keys are
+# still stored on the record and visible via Get/ListMemoryRecords, so they are
+# filtered in-process by :func:`filter_records_by_metadata` instead.
 SECTION_RECORD_TYPE = "section"
-# Metadata keys written on a section record (custom, client-side filterable).
+# Metadata keys written on a section record.
 META_TYPE = "type"
 META_SECTION = "section"
 META_PLANTS = "plants"
+# photo_count is deliberately NOT indexed — it enriches the record but is not a
+# dimension worth spending one of the 10 permanent indexed-key slots on.
 META_PHOTO_COUNT = "photo_count"
+# Keys declared under ``IndexedKeys`` in the template, i.e. the ones that may be
+# used in a server-side ``metadataFilters`` expression. Keep in sync with the
+# template: indexed keys are additive-only and cannot be removed once added.
+INDEXED_METADATA_KEYS = frozenset({META_TYPE, META_SECTION, META_PLANTS})
 # Reserved prefix AgentCore adds to its own metadata keys on stored records.
+# These are filterable without being declared (e.g. the createdAt timestamp).
 RESERVED_METADATA_PREFIX = "x-amz-agentcore-memory-"
+RESERVED_CREATED_AT_KEY = "x-amz-agentcore-memory-createdAt"
 
 
 def derive_section_slug(name: str) -> str:
@@ -946,6 +974,67 @@ def parse_extracted_plants(raw: str) -> list[str]:
     return seen
 
 
+def build_event_metadata(values: dict[str, Any]) -> dict[str, dict[str, str]]:
+    """Build the ``CreateEvent`` metadata map for known-at-event-time values (pure).
+
+    Attaching metadata to the event is the preferred path for keys whose value the
+    application already knows when the turn happens (here: the backyard
+    ``section`` a photo album belongs to). AgentCore propagates it through
+    extraction, so the derived long-term records carry the same dimension instead
+    of depending on the model to re-infer it from prose.
+
+    ``CreateEvent`` metadata values are ``stringValue``-only (unlike
+    ``BatchCreateMemoryRecords``, which also accepts ``stringListValue`` /
+    ``numberValue``), so every value is coerced to a string and empty values are
+    dropped. List-valued dimensions such as ``plants`` cannot travel this path and
+    are supplied on the directly-written record instead.
+
+    Args:
+        values: Plain ``{key: value}`` pairs to attach to the event.
+
+    Returns:
+        The metadata map accepted by ``CreateEvent`` (empty when nothing applies).
+    """
+    out: dict[str, dict[str, str]] = {}
+    for key, value in (values or {}).items():
+        if value is None or isinstance(value, (list, tuple, dict)):
+            continue
+        text = str(value).strip()
+        if text:
+            out[key] = {"stringValue": text}
+    return out
+
+
+def build_section_summary(
+    *, section_name: str, plants: Optional[list[str]] = None, photo_count: int = 0
+) -> str:
+    """Build the record content for a registered section (pure).
+
+    Deliberately terse. Registering one album yields several records covering the
+    same ground — this deterministic one plus whatever the semantic and
+    user-preference strategies extract from the same turn — and all of them
+    compete for the same capped retrieval budget. Embedding the agent's full
+    conversational reply here made this the longest of those duplicates while
+    adding no fact the extracted records lack, so the content is reduced to the
+    durable facts: which bed, which plants, and how many photos it came from.
+
+    Args:
+        section_name: The section name as the gardener wrote it.
+        plants: Plant names identified in the section.
+        photo_count: How many photos the section was registered from.
+
+    Returns:
+        A single-sentence factual summary for the record's ``content.text``.
+    """
+    name = (section_name or "").strip() or "unnamed section"
+    parts = [f"Backyard section '{name}'"]
+    if plants:
+        parts.append("contains " + ", ".join(plants))
+    if photo_count:
+        parts.append(f"registered from {photo_count} photo(s)")
+    return "; ".join(parts) + "."
+
+
 def build_section_record(
     *,
     chat_id: str,
@@ -991,13 +1080,76 @@ def build_section_record(
     }
 
 
+def build_created_after_filter(moment: datetime) -> dict[str, Any]:
+    """Build an ``AFTER`` filter on the service-generated createdAt timestamp (pure).
+
+    The reserved ``x-amz-agentcore-memory-*`` timestamps are filterable WITHOUT
+    being declared as indexed keys, so temporal scoping costs none of the 10
+    permanent indexed-key slots. Useful for "what changed recently" style recall —
+    e.g. scoping a proactive nudge to the last few weeks of garden history.
+
+    Args:
+        moment: Return only records created strictly after this instant.
+
+    Returns:
+        A single ``metadataFilters`` entry.
+    """
+    return {
+        "left": {"metadataKey": RESERVED_CREATED_AT_KEY},
+        "operator": "AFTER",
+        "right": {"metadataValue": {"dateTimeValue": moment}},
+    }
+
+
+def build_metadata_filters(
+    filters: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Split requested filters into server-side expressions and leftovers (pure).
+
+    Keys in :data:`INDEXED_METADATA_KEYS` become ``metadataFilters`` entries for
+    ``RetrieveMemoryRecords``, which AgentCore applies BEFORE the vector search.
+    Everything else is returned as a residual dict for in-process filtering by
+    :func:`filter_records_by_metadata`, because filtering on a non-indexed key
+    would raise ``ValidationException``.
+
+    A list/tuple value on a ``STRINGLIST`` key uses ``CONTAINS`` per element
+    (list membership, e.g. "which beds contain basil"); a scalar uses
+    ``EQUALS_TO`` on a ``STRING`` key and ``CONTAINS`` on ``plants``.
+
+    Args:
+        filters: Requested ``{key: expected}`` metadata pairs.
+
+    Returns:
+        A ``(server_filters, residual_filters)`` tuple.
+    """
+    server: list[dict[str, Any]] = []
+    residual: dict[str, Any] = {}
+    for key, expected in (filters or {}).items():
+        if key not in INDEXED_METADATA_KEYS:
+            residual[key] = expected
+            continue
+        # ``plants`` is a STRINGLIST: membership is expressed with CONTAINS.
+        operator = "CONTAINS" if key == META_PLANTS else "EQUALS_TO"
+        values = expected if isinstance(expected, (list, tuple)) else [expected]
+        for value in values:
+            server.append(
+                {
+                    "left": {"metadataKey": key},
+                    "operator": operator,
+                    "right": {"metadataValue": {"stringValue": str(value)}},
+                }
+            )
+    return server, residual
+
+
 def filter_records_by_metadata(
     records: list["MemoryContextRecord"], filters: dict[str, Any]
 ) -> list["MemoryContextRecord"]:
-    """Filter retrieved records by custom metadata, client-side (pure).
+    """Filter retrieved records by metadata in-process (pure).
 
-    Server-side ``metadataFilters`` reject custom keys (see the module note
-    above), so equality/membership filtering on our own metadata happens here.
+    Used for keys that are NOT declared as ``IndexedKeys`` and therefore cannot
+    appear in a server-side ``metadataFilters`` expression (see the module note
+    above); indexed keys are filtered by the service before the vector search.
     A record matches when, for every ``(key, expected)`` pair, its metadata has
     that key and either equals ``expected`` or — when the stored value is a list
     — contains it. String comparison is case-insensitive.
@@ -1053,9 +1205,9 @@ class MemoryContextRecord:
     topic: str = ""
     record_id: str = ""
     # Flattened custom metadata from the stored record (reserved
-    # ``x-amz-agentcore-memory-*`` keys removed). Enables client-side filtering
-    # (:func:`filter_records_by_metadata`) since the API rejects custom keys in
-    # server-side metadataFilters.
+    # ``x-amz-agentcore-memory-*`` keys removed). Lets callers inspect metadata
+    # on returned records and filter non-indexed keys in-process
+    # (:func:`filter_records_by_metadata`).
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -1336,6 +1488,7 @@ class SproutMemory:
         query: str,
         *,
         metadata_filters: Optional[dict[str, Any]] = None,
+        created_after: Optional[datetime] = None,
     ) -> list[MemoryContextRecord]:
         """Retrieve up to 50 relevant long-term memories (Req 5.1, 5.5).
 
@@ -1348,22 +1501,36 @@ class SproutMemory:
         Args:
             chat_id: The Telegram chat id (the authenticated actor).
             query: The user's current message, used as the semantic search query.
-            metadata_filters: Optional ``{key: expected}`` custom-metadata pairs
-                (e.g. ``{"section": "north_bed"}``). Applied CLIENT-SIDE by
-                :func:`filter_records_by_metadata` because the API rejects custom
-                keys in server-side ``metadataFilters``.
+            metadata_filters: Optional ``{key: expected}`` metadata pairs (e.g.
+                ``{"section": "north_bed"}`` or ``{"plants": "basil"}``). Indexed
+                keys are pushed down as server-side ``metadataFilters`` and
+                applied BEFORE the vector search; any non-indexed key is applied
+                in-process afterwards (see :func:`build_metadata_filters`).
+            created_after: Optional lower bound on record creation time, pushed
+                down as an ``AFTER`` filter on the service-generated
+                ``x-amz-agentcore-memory-createdAt`` field. Reserved timestamps
+                are filterable without consuming an indexed-key slot.
 
         Returns:
             The normalized, retrieved records (unassembled), or ``[]`` on
             timeout/error.
         """
-        namespace = derive_long_term_namespace(chat_id)
+        # Use namespacePath (hierarchical), not namespace (exact): an exact query
+        # returns only records at precisely that namespace, silently omitting any
+        # stored deeper in the subtree.
+        namespace_path = derive_long_term_namespace_path(chat_id)
+        server_filters, residual_filters = build_metadata_filters(metadata_filters or {})
+        if created_after is not None:
+            server_filters.append(build_created_after_filter(created_after))
 
         def _call() -> list[dict[str, Any]]:
+            search_criteria: dict[str, Any] = {"searchQuery": query}
+            if server_filters:
+                search_criteria["metadataFilters"] = server_filters
             response = self._agentcore_client().retrieve_memory_records(
                 memoryId=self._memory_id,
-                namespace=namespace,
-                searchCriteria={"searchQuery": query},
+                namespacePath=namespace_path,
+                searchCriteria=search_criteria,
                 maxResults=MAX_MEMORIES_IN_CONTEXT,
             )
             if not isinstance(response, dict):
@@ -1397,9 +1564,17 @@ class SproutMemory:
             executor.shutdown(wait=False)
 
         normalized = [normalize_record(raw) for raw in raw_records if isinstance(raw, dict)]
-        return filter_records_by_metadata(normalized, metadata_filters or {})
+        # Indexed keys were already applied by the service; only non-indexed
+        # keys remain to filter in-process.
+        return filter_records_by_metadata(normalized, residual_filters)
 
-    def persist(self, chat_id: str, session_id: str, messages: list[dict[str, str]]) -> bool:
+    def persist(
+        self,
+        chat_id: str,
+        session_id: str,
+        messages: list[dict[str, str]],
+        metadata: Optional[dict[str, dict[str, str]]] = None,
+    ) -> bool:
         """Persist the session transcript via ``CreateEvent`` (Req 4.4, 4.6).
 
         Keys the event by ``memoryId`` + ``actorId`` (the chat id) + ``sessionId``
@@ -1412,6 +1587,12 @@ class SproutMemory:
             session_id: The per-invocation session id.
             messages: Ordered ``{"role", "content"}`` turns (roles ``USER`` /
                 ``ASSISTANT``).
+            metadata: Optional ``CreateEvent`` metadata map (see
+                :func:`build_event_metadata`) for dimensions known at event time,
+                e.g. the ``section`` a photo album belongs to. AgentCore
+                propagates it through extraction onto the derived records, so
+                metadata is attached on the event path too — not only on records
+                written directly via ``BatchCreateMemoryRecords``.
 
         Returns:
             ``True`` when the event was created, ``False`` when persistence
@@ -1426,14 +1607,17 @@ class SproutMemory:
             }
             for message in messages
         ]
+        kwargs: dict[str, Any] = {
+            "memoryId": self._memory_id,
+            "actorId": chat_id,
+            "sessionId": session_id,
+            "eventTimestamp": datetime.now(timezone.utc),
+            "payload": payload,
+        }
+        if metadata:
+            kwargs["metadata"] = metadata
         try:
-            self._agentcore_client().create_event(
-                memoryId=self._memory_id,
-                actorId=chat_id,
-                sessionId=session_id,
-                eventTimestamp=datetime.now(timezone.utc),
-                payload=payload,
-            )
+            self._agentcore_client().create_event(**kwargs)
             return True
         except Exception:  # noqa: BLE001 — non-fatal (Req 4.6).
             logger.error(
@@ -1451,6 +1635,14 @@ class SproutMemory:
         queryable metadata. Failures are logged and swallowed — a missing
         structured record must never break the user's turn, since the
         conversational transcript is still persisted.
+
+        Note:
+            ``memoryStrategyId`` is deliberately NOT set on these records. With it,
+            the service filters the supplied metadata down to that strategy's
+            schema and silently drops anything else — which would discard
+            ``photo_count`` (intentionally not part of any strategy schema).
+            Omitting it stores the metadata as supplied. The indexed keys still
+            behave identically for filtering either way.
 
         Args:
             records: Record dicts from :func:`build_section_record`.
@@ -2492,6 +2684,19 @@ class SproutRuntime:
 
         # 7. Persist transcript (non-fatal, Req 4.4, 4.6). Persist the cleaned
         #    reply (directives removed) so memory extraction never sees the tags.
+        #     Attach known-at-event-time metadata (the section a captioned album
+        #     belongs to) so extraction propagates the same dimension onto the
+        #     records it derives, rather than re-inferring it from prose.
+        event_metadata = (
+            build_event_metadata(
+                {
+                    META_TYPE: SECTION_RECORD_TYPE,
+                    META_SECTION: derive_section_slug(album_section_caption),
+                }
+            )
+            if album_section_caption
+            else {}
+        )
         persisted = self._memory.persist(
             chat_id,
             session_id,
@@ -2499,6 +2704,7 @@ class SproutRuntime:
                 {"role": "USER", "content": message},
                 {"role": "ASSISTANT", "content": response_text},
             ],
+            metadata=event_metadata or None,
         )
 
         # 7b. Register a named backyard section as a STRUCTURED record when the
@@ -2517,9 +2723,10 @@ class SproutRuntime:
                     build_section_record(
                         chat_id=chat_id,
                         section_name=album_section_caption,
-                        summary=(
-                            f"Backyard section '{album_section_caption}' "
-                            f"(registered from {len(images)} photo(s)): {response_text}"
+                        summary=build_section_summary(
+                            section_name=album_section_caption,
+                            plants=plants,
+                            photo_count=len(images),
                         ),
                         plants=plants,
                         photo_count=len(images),

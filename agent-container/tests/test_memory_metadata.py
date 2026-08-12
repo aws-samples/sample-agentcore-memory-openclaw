@@ -4,11 +4,13 @@ The gardener's backyard sections are written DELIBERATELY as structured
 AgentCore Memory records (``BatchCreateMemoryRecords``) with queryable metadata,
 rather than relying only on asynchronous extraction from chat text.
 
-IMPORTANT (verified against the live API): custom metadata keys are stored on the
-record and returned on retrieval, but ``RetrieveMemoryRecords``' server-side
-``metadataFilters`` rejects them ("not a valid filter key") — only reserved
-``x-amz-agentcore-memory-*`` keys are accepted. So custom-metadata filtering is
-client-side, which these tests pin down.
+IMPORTANT (verified against the live service): custom metadata keys ARE filterable
+server-side, but only when declared as ``IndexedKeys`` on the memory resource —
+AgentCore then applies them BEFORE the vector search. Filtering on a key that is
+not indexed raises ``ValidationException`` ("not a valid filter key"); such keys
+are still stored and returned, so they are filtered in-process instead. These
+tests pin down that split so filters are not silently stopped from being pushed
+down (which would let a record be missed because it did not rank in the top-K).
 
 Covers the pure builders (:func:`server.derive_section_slug`,
 :func:`server.build_metadata_map`, :func:`server.flatten_metadata`,
@@ -134,7 +136,7 @@ def test_build_section_record_unnamed_fallback():
 
 
 # =============================================================================
-# filter_records_by_metadata (client-side; API rejects custom filter keys)
+# filter_records_by_metadata (in-process; for keys that are NOT indexed)
 # =============================================================================
 def _rec(content, **metadata):
     return MemoryContextRecord(
@@ -233,38 +235,116 @@ def test_write_records_noop_on_empty():
 
 
 # =============================================================================
-# retrieve() applies custom-metadata filters client-side
+# retrieve(): indexed keys filter server-side, others in-process
 # =============================================================================
 class _RetrieveClient:
+    """Fake that honors ``metadataFilters`` the way the service does.
+
+    The real service pre-filters on indexed keys BEFORE the vector search, so a
+    filtered request must come back already narrowed — this fake reproduces that
+    so the test would fail if we silently stopped pushing filters down.
+    """
+
+    _RECORDS = [
+        {
+            "content": {"text": "north bed: basil"},
+            "metadata": {
+                "section": {"stringValue": "north_bed"},
+                "plants": {"stringListValue": ["basil", "tomato"]},
+                "photo_count": {"numberValue": 2.0},
+            },
+        },
+        {
+            "content": {"text": "south bed: roses"},
+            "metadata": {
+                "section": {"stringValue": "south_bed"},
+                "plants": {"stringListValue": ["rose"]},
+                "photo_count": {"numberValue": 5.0},
+            },
+        },
+    ]
+
     def retrieve_memory_records(self, **kwargs):
         self.last_kwargs = kwargs
-        return {
-            "memoryRecordSummaries": [
-                {
-                    "content": {"text": "north bed: basil"},
-                    "metadata": {"section": {"stringValue": "north_bed"}},
-                },
-                {
-                    "content": {"text": "south bed: roses"},
-                    "metadata": {"section": {"stringValue": "south_bed"}},
-                },
-            ]
-        }
+        out = []
+        for rec in self._RECORDS:
+            keep = True
+            for f in kwargs["searchCriteria"].get("metadataFilters", []):
+                key = f["left"]["metadataKey"]
+                want = f["right"]["metadataValue"]["stringValue"]
+                wrapped = rec["metadata"].get(key, {})
+                actual = wrapped.get("stringValue", wrapped.get("stringListValue"))
+                if f["operator"] == "EQUALS_TO" and actual != want:
+                    keep = False
+                elif f["operator"] == "CONTAINS" and want not in (actual or []):
+                    keep = False
+            if keep:
+                out.append(rec)
+        return {"memoryRecordSummaries": out}
 
 
-def test_retrieve_filters_custom_metadata_client_side():
+def test_retrieve_pushes_indexed_keys_down_as_server_side_filters():
     client = _RetrieveClient()
     mem = SproutMemory(memory_id="mem-1", client=client)
 
-    all_records = mem.retrieve("12345", "beds")
-    assert len(all_records) == 2
+    assert len(mem.retrieve("12345", "beds")) == 2
+    # No filters requested -> no metadataFilters in the request at all.
+    assert "metadataFilters" not in client.last_kwargs["searchCriteria"]
 
     filtered = mem.retrieve("12345", "beds", metadata_filters={"section": "north_bed"})
     assert [r.content for r in filtered] == ["north bed: basil"]
 
-    # Custom keys must NOT be sent as server-side metadataFilters (the API
-    # rejects them); the request carries only the semantic search query.
+    sent = client.last_kwargs["searchCriteria"]["metadataFilters"]
+    assert sent == [
+        {
+            "left": {"metadataKey": "section"},
+            "operator": "EQUALS_TO",
+            "right": {"metadataValue": {"stringValue": "north_bed"}},
+        }
+    ]
+
+
+def test_retrieve_uses_contains_for_stringlist_plants():
+    client = _RetrieveClient()
+    mem = SproutMemory(memory_id="mem-1", client=client)
+
+    filtered = mem.retrieve("12345", "beds", metadata_filters={"plants": "basil"})
+
+    assert [r.content for r in filtered] == ["north bed: basil"]
+    assert client.last_kwargs["searchCriteria"]["metadataFilters"][0]["operator"] == "CONTAINS"
+
+
+def test_retrieve_filters_non_indexed_key_in_process():
+    client = _RetrieveClient()
+    mem = SproutMemory(memory_id="mem-1", client=client)
+
+    # photo_count is NOT an indexed key: it must never be sent to the service
+    # (that would raise ValidationException) and is applied in-process instead.
+    filtered = mem.retrieve("12345", "beds", metadata_filters={"photo_count": 5.0})
+
+    assert [r.content for r in filtered] == ["south bed: roses"]
     assert "metadataFilters" not in client.last_kwargs["searchCriteria"]
+
+
+def test_build_metadata_filters_splits_indexed_from_residual():
+    pushed, residual = server.build_metadata_filters(
+        {"section": "north_bed", "photo_count": 2}
+    )
+
+    assert [f["left"]["metadataKey"] for f in pushed] == ["section"]
+    assert residual == {"photo_count": 2}
+
+
+def test_build_metadata_filters_expands_list_values():
+    pushed, residual = server.build_metadata_filters({"plants": ["basil", "mint"]})
+
+    assert [f["right"]["metadataValue"]["stringValue"] for f in pushed] == ["basil", "mint"]
+    assert all(f["operator"] == "CONTAINS" for f in pushed)
+    assert residual == {}
+
+
+def test_build_metadata_filters_empty_is_noop():
+    assert server.build_metadata_filters({}) == ([], {})
 
 
 # =============================================================================
@@ -311,7 +391,7 @@ class _RecordingMemory:
     def retrieve(self, chat_id, query, *, metadata_filters=None):
         return []
 
-    def persist(self, chat_id, session_id, messages):
+    def persist(self, chat_id, session_id, messages, metadata=None):
         return True
 
     def write_records(self, records):
@@ -519,3 +599,212 @@ def test_plants_metadata_is_filterable_client_side():
     ]
     out = filter_records_by_metadata(records, {"plants": "Basil"})
     assert [r.content for r in out] == ["north"]
+
+
+# =============================================================================
+# CreateEvent metadata: dimensions known at event time travel the event path too
+# =============================================================================
+from server import build_event_metadata  # noqa: E402
+
+
+def test_build_event_metadata_stringvalue_only():
+    # CreateEvent metadata is stringValue-only; numbers are coerced, and
+    # list-valued dimensions (plants) cannot travel this path at all.
+    out = build_event_metadata({"section": "north_bed", "photo_count": 3, "plants": ["basil"]})
+    assert out == {
+        "section": {"stringValue": "north_bed"},
+        "photo_count": {"stringValue": "3"},
+    }
+
+
+def test_build_event_metadata_drops_empty():
+    assert build_event_metadata({"a": None, "b": "", "c": "  ", "d": "keep"}) == {
+        "d": {"stringValue": "keep"}
+    }
+
+
+class _EventClient:
+    def __init__(self):
+        self.kwargs = None
+
+    def create_event(self, **kwargs):
+        self.kwargs = kwargs
+        return {}
+
+
+def test_persist_sends_metadata_on_create_event():
+    client = _EventClient()
+    mem = SproutMemory(memory_id="mem-1", client=client)
+
+    ok = mem.persist(
+        "12345",
+        "sess-1",
+        [{"role": "USER", "content": "hi"}],
+        metadata={"section": {"stringValue": "north_bed"}},
+    )
+
+    assert ok is True
+    assert client.kwargs["metadata"] == {"section": {"stringValue": "north_bed"}}
+
+
+def test_persist_omits_metadata_key_when_none():
+    client = _EventClient()
+    mem = SproutMemory(memory_id="mem-1", client=client)
+
+    mem.persist("12345", "sess-1", [{"role": "USER", "content": "hi"}])
+
+    # Never send an empty metadata map — omit the parameter entirely.
+    assert "metadata" not in client.kwargs
+
+
+class _MetadataCapturingMemory(_RecordingMemory):
+    def __init__(self):
+        super().__init__()
+        self.persist_metadata = "unset"
+
+    def persist(self, chat_id, session_id, messages, metadata=None):
+        self.persist_metadata = metadata
+        return True
+
+
+def test_captioned_album_attaches_section_metadata_to_the_event():
+    memory = _MetadataCapturingMemory()
+    runtime = server.SproutRuntime(
+        memory=memory,
+        workspace=_StubWorkspace(),
+        agent=_StubAgent(),
+        base_persona="You are Sprout.",
+        model_id="model",
+        album_buffer=server.AlbumBuffer("bucket", client=_FakeS3(), debounce_seconds=0),
+    )
+
+    runtime.handle_invocation(_album_payload("gev1"))
+
+    # The section is known at event time, so it rides the CreateEvent path and
+    # extraction propagates it onto the records it derives.
+    assert memory.persist_metadata == {
+        "type": {"stringValue": "section"},
+        "section": {"stringValue": "north_bed"},
+    }
+
+
+def test_normal_turn_sends_no_event_metadata():
+    memory = _MetadataCapturingMemory()
+    runtime = server.SproutRuntime(
+        memory=memory,
+        workspace=_StubWorkspace(),
+        agent=_StubAgent(),
+        base_persona="You are Sprout.",
+        model_id="model",
+    )
+
+    runtime.handle_invocation({"user_id": "12345", "message": "hello"})
+
+    assert memory.persist_metadata is None
+
+
+# =============================================================================
+# Temporal filtering on the reserved createdAt field
+# =============================================================================
+def test_build_created_after_filter_uses_reserved_key():
+    moment = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+
+    f = server.build_created_after_filter(moment)
+
+    assert f == {
+        "left": {"metadataKey": "x-amz-agentcore-memory-createdAt"},
+        "operator": "AFTER",
+        "right": {"metadataValue": {"dateTimeValue": moment}},
+    }
+
+
+def test_retrieve_pushes_created_after_down():
+    client = _RetrieveClient()
+    mem = SproutMemory(memory_id="mem-1", client=client)
+    moment = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+
+    mem.retrieve("12345", "beds", created_after=moment)
+
+    sent = client.last_kwargs["searchCriteria"]["metadataFilters"]
+    assert sent == [server.build_created_after_filter(moment)]
+
+
+def test_retrieve_combines_indexed_and_temporal_filters():
+    client = _RetrieveClient()
+    mem = SproutMemory(memory_id="mem-1", client=client)
+    moment = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+
+    mem.retrieve(
+        "12345", "beds", metadata_filters={"section": "north_bed"}, created_after=moment
+    )
+
+    keys = [f["left"]["metadataKey"] for f in client.last_kwargs["searchCriteria"]["metadataFilters"]]
+    assert keys == ["section", "x-amz-agentcore-memory-createdAt"]
+
+
+# =============================================================================
+# build_section_summary: terse content (several records cover the same fact)
+# =============================================================================
+def test_section_summary_is_terse_and_factual():
+    s = server.build_section_summary(
+        section_name="Herb bed", plants=["basil", "mint"], photo_count=2
+    )
+    assert s == "Backyard section 'Herb bed'; contains basil, mint; registered from 2 photo(s)."
+
+
+def test_section_summary_omits_missing_parts():
+    assert server.build_section_summary(section_name="North bed") == "Backyard section 'North bed'."
+
+
+def test_section_summary_handles_blank_name():
+    assert server.build_section_summary(section_name="  ").startswith("Backyard section 'unnamed section'")
+
+
+def test_section_record_content_excludes_the_agent_reply():
+    memory = _RecordingMemory()
+    runtime = server.SproutRuntime(
+        memory=memory,
+        workspace=_StubWorkspace(),
+        agent=_PlantAgent(["basil", "mint"]),
+        base_persona="You are Sprout.",
+        model_id="model",
+        album_buffer=server.AlbumBuffer("bucket", client=_FakeS3(), debounce_seconds=0),
+    )
+
+    runtime.handle_invocation(_album_payload("gsum1"))
+
+    text = memory.written[0]["content"]["text"]
+    # The conversational reply must not be embedded — extraction already stores
+    # its own (tighter) version of the same fact.
+    assert "Lovely bed!" not in text
+    assert text == "Backyard section 'North bed'; contains basil, mint; registered from 1 photo(s)."
+
+
+# =============================================================================
+# Namespace vs namespacePath: summaries live one level deeper
+# =============================================================================
+def test_retrieve_uses_namespacepath_not_exact_namespace():
+    """Regression guard for a bug we shipped and had to correct.
+
+    ``namespace`` matches ONLY the exact namespace given (verified against the
+    service), so querying it omits session summaries stored at
+    ``sprout/{chat_id}/long_term/{sessionId}`` — leaving the summarization
+    strategy write-only, the very problem moving it was meant to fix.
+    ``namespacePath`` retrieves the whole subtree.
+    """
+    client = _RetrieveClient()
+    mem = SproutMemory(memory_id="mem-1", client=client)
+
+    mem.retrieve("12345", "beds")
+
+    assert client.last_kwargs["namespacePath"] == "sprout/12345/long_term"
+    assert "namespace" not in client.last_kwargs
+
+
+def test_long_term_namespace_path_matches_the_strategy_namespace():
+    # Both extraction strategies write to exactly this namespace; the path form is
+    # what retrieval uses so a nested strategy would also be covered.
+    assert server.derive_long_term_namespace_path("12345") == "sprout/12345/long_term"
+    assert server.derive_long_term_namespace_path("12345") == server.derive_long_term_namespace(
+        "12345"
+    )

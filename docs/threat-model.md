@@ -128,7 +128,7 @@ Each threat is rated for pre-mitigation severity and marked **Mitigated**,
 
 | ID | Threat | Severity | Mitigation | Status |
 |----|--------|----------|------------|--------|
-| I-1 | Cross-user memory/data leakage | High | Memory is namespaced `sprout/{chat_id}/long_term` and `.../episodic/{sessionId}`; retrieval is scoped to the caller's namespace; S3 workspace prefix is `workspace/{chat_id}/`. `derive_*_namespace` embeds the chat id as the sole variable segment so no two users collide. | Mitigated |
+| I-1 | Cross-user memory/data leakage | High | Memory is namespaced `sprout/{chat_id}/long_term`; retrieval is scoped to the caller's own subtree via `namespacePath` (`sprout/{chat_id}/long_term`), which cannot reach another chat id's subtree; S3 workspace prefix is `workspace/{chat_id}/`. `derive_*_namespace` embeds the chat id as the sole variable segment so no two users collide. | Mitigated |
 | I-2 | Secrets leaked in logs, source, or history | High | Secret-history scan of the repo is clean; `.env` is gitignored and never tracked; token read from Secrets Manager at runtime, never echoed; `NoEcho: true` on the CFN token parameter. | Mitigated |
 | I-3 | S3 bucket public exposure | High | `PublicAccessBlockConfiguration` all four flags true; bucket policy grants only the runtime role; TLS enforced. | Mitigated |
 | I-4 | Overly broad IAM enabling data access beyond need | Medium | Each role (runtime, memory, webhook, cron, scheduler) has a dedicated least-privilege policy scoped to account/region-qualified ARNs. `bedrock:InvokeModel` on `foundation-model/*` is required for cross-region inference profiles (documented, see §7). | Partial |

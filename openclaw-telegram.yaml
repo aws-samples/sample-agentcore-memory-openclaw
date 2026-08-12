@@ -625,8 +625,10 @@ Resources:
   # AgentCore Memory provides cross-session recall. The managed extraction
   # strategies asynchronously derive long-term records from session events.
   #   - USER_PREFERENCE  -> explicit user preferences  -> sprout/{actorId}/long_term
-  #   - SEMANTIC         -> inferred factual knowledge  -> sprout/{actorId}/long_term
-  #   - SUMMARIZATION    -> episodic session summaries  -> sprout/{actorId}/episodic/{sessionId}
+  #   - SEMANTIC         -> inferred factual knowledge -> sprout/{actorId}/long_term
+  # Both write to sprout/{actorId}/long_term, which the runtime retrieves with the
+  # hierarchical `namespacePath` parameter (so any future strategy nested under it
+  # is included without a code change).
   # Memory resource names must match [a-zA-Z][a-zA-Z0-9_]{0,47} (no hyphens),
   # so a static underscore-free name is used rather than the stack name.
   AgentCoreMemory:
@@ -636,22 +638,133 @@ Resources:
       Description: Cross-session memory for the Sprout gardening assistant
       EventExpiryDuration: 30
       MemoryExecutionRoleArn: !GetAtt MemoryExecutionRole.Arn
+      # Metadata keys indexed for server-side filtering on RetrieveMemoryRecords /
+      # ListMemoryRecords. ONLY indexed keys are filterable — filtering on a
+      # non-indexed key raises ValidationException ("not a valid filter key").
+      # Non-indexed metadata (e.g. photo_count) is still stored on records and
+      # returned by Get/ListMemoryRecords; it just cannot appear in a filter.
+      #
+      # IMPORTANT: indexed keys are ADDITIVE-ONLY and cannot be removed once
+      # added (max 10 per memory). Keep this list to the dimensions actually
+      # filtered on, and add new ones deliberately rather than speculatively.
+      IndexedKeys:
+        - Key: type
+          Type: STRING
+        - Key: section
+          Type: STRING
+        - Key: plants
+          Type: STRINGLIST
       MemoryStrategies:
+        # Each strategy declares a MetadataSchema so extraction populates the
+        # same dimensions the app writes directly via BatchCreateMemoryRecords.
+        # Definition + LlmExtractionInstruction ARE the instructions given to the
+        # extraction model (this replaces reaching for an AppendToPrompt
+        # override), and Validation constrains the output so filter values stay
+        # consistent — without it the model may emit "Herbs"/"herbs"/"HERB" for
+        # one concept and break downstream matching.
         - UserPreferenceMemoryStrategy:
             Name: SproutUserPreference
             Description: Extracts explicit user gardening preferences
             Namespaces:
               - "sprout/{actorId}/long_term"
+            MemoryRecordSchema:
+              MetadataSchema:
+                - Key: type
+                  Type: STRING
+                  ExtractionConfig:
+                    LlmExtractionConfig:
+                      Definition: >-
+                        The kind of gardening fact this record captures. Use
+                        'preference' for how the gardener likes to garden
+                        (organic vs synthetic, containers vs in-ground, watering
+                        style), 'section' for a named bed or area of the
+                        backyard, and 'plant' for a fact about a specific plant.
+                      LlmExtractionInstruction: LATEST_VALUE
+                      Validation:
+                        StringValidation:
+                          AllowedValues:
+                            - preference
+                            - section
+                            - plant
+                - Key: section
+                  Type: STRING
+                  ExtractionConfig:
+                    LlmExtractionConfig:
+                      Definition: >-
+                        The named area of the backyard this fact belongs to, as
+                        the gardener refers to it (for example 'north_bed',
+                        'herb_bed', 'front_planters'). Normalize to lowercase
+                        with underscores. Omit when the fact is not tied to a
+                        specific area.
+                      LlmExtractionInstruction: LATEST_VALUE
+                - Key: plants
+                  Type: STRINGLIST
+                  ExtractionConfig:
+                    LlmExtractionConfig:
+                      Definition: >-
+                        Common names of the plants this fact concerns, lowercase
+                        and singular (for example 'basil', 'tomato', 'mint').
+                        Include only plants the gardener actually grows or asked
+                        about; omit soil, tools, and containers.
+                      Validation:
+                        StringListValidation:
+                          MaxItems: 5
         - SemanticMemoryStrategy:
             Name: SproutSemantic
             Description: Extracts inferred factual knowledge about the user's garden
             Namespaces:
               - "sprout/{actorId}/long_term"
-        - SummaryMemoryStrategy:
-            Name: SproutSummarization
-            Description: Condenses session transcripts into episodic summaries
-            Namespaces:
-              - "sprout/{actorId}/episodic/{sessionId}"
+            MemoryRecordSchema:
+              MetadataSchema:
+                - Key: type
+                  Type: STRING
+                  ExtractionConfig:
+                    LlmExtractionConfig:
+                      Definition: >-
+                        The kind of gardening fact this record captures: 'section'
+                        for a named bed or area of the backyard, 'plant' for a
+                        fact about a specific plant, 'condition' for climate,
+                        sun, soil, or drainage, and 'care' for a watering,
+                        feeding, or pruning routine.
+                      LlmExtractionInstruction: LATEST_VALUE
+                      Validation:
+                        StringValidation:
+                          AllowedValues:
+                            - section
+                            - plant
+                            - condition
+                            - care
+                - Key: section
+                  Type: STRING
+                  ExtractionConfig:
+                    LlmExtractionConfig:
+                      Definition: >-
+                        The named area of the backyard this fact belongs to, as
+                        the gardener refers to it (for example 'north_bed',
+                        'herb_bed', 'front_planters'). Normalize to lowercase
+                        with underscores. Omit when the fact is not tied to a
+                        specific area.
+                      LlmExtractionInstruction: LATEST_VALUE
+                - Key: plants
+                  Type: STRINGLIST
+                  ExtractionConfig:
+                    LlmExtractionConfig:
+                      Definition: >-
+                        Common names of the plants this fact concerns, lowercase
+                        and singular (for example 'basil', 'tomato', 'mint').
+                        Include only plants the gardener actually grows or asked
+                        about; omit soil, tools, and containers.
+                      Validation:
+                        StringListValidation:
+                          MaxItems: 5
+        # NOTE: there is deliberately no SummaryMemoryStrategy. Session summaries
+        # duplicated, in looser prose, facts the semantic and user-preference
+        # strategies already extract — while costing extraction on every session
+        # and competing for the capped retrieval budget (summaries accumulate one
+        # per session indefinitely). If you add one back: its namespace MUST end
+        # in {sessionId} (the service rejects it otherwise), which is why
+        # retrieval below uses the hierarchical `namespacePath` — an exact
+        # `namespace` query would not return records nested under it.
 
   # ----------------------------------------------------------------------------
   # AgentCore Runtime

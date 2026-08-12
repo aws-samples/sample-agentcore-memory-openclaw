@@ -154,7 +154,7 @@ class _FakeMemory:
     def retrieve(self, chat_id, query, *, metadata_filters=None):
         return []
 
-    def persist(self, chat_id, session_id, messages):
+    def persist(self, chat_id, session_id, messages, metadata=None):
         self.persisted = messages
         return True
 

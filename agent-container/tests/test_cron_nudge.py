@@ -44,7 +44,7 @@ class FakeMemory:
         self.retrieve_args = (chat_id, query)
         return list(self._records)
 
-    def persist(self, chat_id, session_id, messages):
+    def persist(self, chat_id, session_id, messages, metadata=None):
         self.calls.append("persist")
         return True
 
