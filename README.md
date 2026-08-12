@@ -52,7 +52,7 @@ flowchart LR
     EB[EventBridge<br/>Scheduler]
     CRON[Cron Lambda]
     RT[AgentCore Runtime<br/>OpenClaw container linux/arm64<br/>server.py memory hooks]
-    MEM[(AgentCore Memory<br/>sprout/&#123;chat_id&#125;/long_term<br/>user-preference + semantic)]
+    MEM[("AgentCore Memory<br/>sprout/{chat_id}/long_term<br/>user-preference + semantic")]
     S3[(S3 Workspace Store)]
     BR[Bedrock Model<br/>Claude Haiku 4.5]
 
