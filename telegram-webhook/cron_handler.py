@@ -310,18 +310,17 @@ def lambda_handler(event: dict, context: Any) -> dict:
     }
 
     if not runtime_arn or not secret_arn:
-        # Log only the NAMES of the env vars that are unset — never the values
-        # (or anything derived from them), so no sensitive-named value reaches
-        # the log sink (CodeQL py/clear-text-logging-sensitive-data).
-        missing = [
-            name
-            for name, is_set in (
-                (RUNTIME_ARN_ENV, bool(runtime_arn)),
-                (BOT_TOKEN_SECRET_ARN_ENV, bool(secret_arn)),
+        # Do not log secret-related identifiers or values. Emit only a generic
+        # count to preserve operational signal without exposing sensitive names.
+        missing_count = sum(
+            1
+            for is_set in (
+                bool(runtime_arn),
+                bool(secret_arn),
             )
             if not is_set
-        ]
-        logger.error("Missing required configuration (unset): %s", ", ".join(missing))
+        )
+        logger.error("Missing required configuration (unset_count=%d)", missing_count)
         return summary
 
     if not chat_ids:
